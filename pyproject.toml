@@ -1,0 +1,40 @@
+[project]
+name = "polymarket-bot"
+version = "0.1.0"
+description = "Retail-tier Polymarket trading bot — disciplined, well-tested, no magic."
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31.0",
+    "py-clob-client-v2>=1.0.1",
+    "python-dotenv>=1.0.0",
+    "cvxpy>=1.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "vcrpy>=6.0.0",
+    "pytest-vcr>=1.0.0",
+    "types-requests>=2.31.0",
+    "ruff>=0.8.0",
+    "mypy>=1.10.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: requires live DB or network (skipped by default)"]

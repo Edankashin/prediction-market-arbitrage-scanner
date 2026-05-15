@@ -1,0 +1,44 @@
+[gamma]
+base_url = "https://gamma-api.polymarket.com"
+requests_per_second = 1.0
+timeout_sec = 15
+max_retries = 3
+backoff_factor = 1.0
+
+[clob]
+host = "https://clob.polymarket.com"
+requests_per_second = 4.0
+timeout_sec = 15
+max_retries = 3
+backoff_factor = 1.0
+chain_id = 137  # 137 = Polygon mainnet; 80002 = Amoy testnet
+
+[data_api]
+base_url = "https://data-api.polymarket.com"
+timeout_sec = 15
+max_retries = 3
+backoff_factor = 1.0
+
+[db]
+path = "data/polymarket.db"
+snapshot_retention_days = 30
+
+[fees]
+# TTL in seconds before re-fetching /fee-rate. Fee schedules change rarely.
+cache_ttl_sec = 300
+
+[gas]
+# Conservative fixed per-order cost in USDC. Polygon ~$0.003-0.005 at typical gas.
+# Live MATIC pricing deferred to M3+.
+usdc_per_order = 0.005
+
+[kelly]
+half_kelly_factor = 0.5
+max_position_pct = 0.03  # hard 3% portfolio cap
+
+[logging]
+level = "INFO"
+log_dir = "logs"
+
+[snapshot]
+interval_sec = 30
