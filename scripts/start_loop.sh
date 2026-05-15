@@ -23,7 +23,7 @@ fi
 
 mkdir -p "$PROJECT_ROOT/logs"
 
-nohup "$VENV_PYTHON" -m app.run loop \
+nohup caffeinate -i "$VENV_PYTHON" -m app.run loop \
     --interval 60 \
     --top 50 \
     --by volume_24h \
