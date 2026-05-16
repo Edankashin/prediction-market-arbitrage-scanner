@@ -174,6 +174,29 @@ CREATE TABLE IF NOT EXISTS data_api_positions (
 )
 """
 
+_SCAN_LOG = """
+CREATE TABLE IF NOT EXISTS scan_log (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                     TEXT NOT NULL,
+    discovered_at          TEXT NOT NULL,
+    event_id               TEXT NOT NULL,
+    event_title            TEXT NOT NULL DEFAULT '',
+    leg_count              INTEGER NOT NULL,
+    gross_edge_bps         INTEGER NOT NULL,
+    net_edge_bps           INTEGER NOT NULL,
+    dominant_cost          TEXT NOT NULL,
+    total_cost_usdc        TEXT NOT NULL,
+    guaranteed_payoff_usdc TEXT NOT NULL,
+    optimal_shares         TEXT NOT NULL,
+    legs_json              TEXT NOT NULL
+)
+"""
+
+_IDX_SCAN_LOG_TS_NET = """
+CREATE INDEX IF NOT EXISTS idx_scan_log_ts_net
+    ON scan_log(ts, net_edge_bps DESC)
+"""
+
 _SCHEMA_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER NOT NULL,
@@ -198,10 +221,12 @@ _ALL_DDL = [
     _PORTFOLIO_SNAPSHOTS,
     _IDX_PORTFOLIO_MODE_TS,
     _DATA_API_POSITIONS,
+    _SCAN_LOG,
+    _IDX_SCAN_LOG_TS_NET,
     _SCHEMA_VERSION,
 ]
 
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 
 
 def migrate(conn: sqlite3.Connection) -> None:

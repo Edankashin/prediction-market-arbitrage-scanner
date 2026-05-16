@@ -5,6 +5,8 @@ Usage (from repo root):
     python -m app.run discover
     python -m app.run snapshot [--top N] [--by volume_24h|liquidity|spread]
     python -m app.run stats
+    python -m app.run scan
+    python -m app.run scan-log
     python -m app.run backtest --start 2026-05-01T00:00:00 --end 2026-05-14T00:00:00
     python -m app.run loop [--interval 60] [--top 50] [--by volume_24h] [--discover-every 900]
 """
@@ -27,6 +29,7 @@ from app.utils.helpers import configure_logging
 _log = logging.getLogger(__name__)
 
 _BY_CHOICES = ["volume_24h", "liquidity", "spread"]
+_SCAN_EVERY = 5  # run cmd_scan every N snapshot cycles inside the loop
 
 # ---------------------------------------------------------------------------
 # SIGTERM / stop-flag machinery
@@ -228,6 +231,100 @@ def cmd_backtest(cfg: object, start: str, end: str) -> None:  # type: ignore[typ
     print_report(result)
 
 
+def cmd_scan(cfg: object) -> int:  # type: ignore[type-arg]
+    """Scan the latest snapshot window for NegRisk arb; write hits to scan_log.
+
+    Fetches the most recent snapshot per token within the last 90 seconds,
+    groups by event_id, and calls scan_event() on each NegRisk event with
+    ≥ 2 legs.  Opportunities are appended to scan_log.  Returns the count found.
+    """
+    from collections import defaultdict
+
+    from app.db import schema, store
+    from app.strategies.negrisk_scanner import ScanConfig, scan_event
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+
+    snaps = store.get_latest_snapshots_in_window(conn, window_sec=90)
+    if not snaps:
+        _log.info("scan_no_snapshots")
+        return 0
+
+    all_markets = store.get_active_markets(conn)
+    market_map = {m.condition_id: m for m in all_markets}
+
+    event_snaps: dict[str, list] = defaultdict(list)
+    for snap in snaps:
+        mkt = market_map.get(snap.condition_id)
+        if mkt and mkt.neg_risk and mkt.event_id:
+            event_snaps[mkt.event_id].append(snap)
+
+    scan_cfg = ScanConfig(
+        gas_usdc_per_order=Decimal(str(cfg.gas.usdc_per_order))  # type: ignore[attr-defined]
+    )
+
+    opps_found = 0
+    events_scanned = 0
+    for event_id, group_snaps in event_snaps.items():
+        if len(group_snaps) < 2:
+            continue
+        events_scanned += 1
+        event_markets = {s.condition_id: market_map[s.condition_id] for s in group_snaps}
+        event_title = next(
+            (m.event_title or "" for m in event_markets.values()), ""
+        )
+        opp = scan_event(group_snaps, event_markets, scan_cfg)
+        if opp is not None:
+            store.insert_scan_log_entry(conn, opp, event_title)
+            opps_found += 1
+
+    _log.info(
+        "scan_complete",
+        extra={"opps_found": opps_found, "events_scanned": events_scanned},
+    )
+    return opps_found
+
+
+def cmd_scan_log(cfg: object) -> None:  # type: ignore[type-arg]
+    """Print the last 24 h of scan_log entries with a summary footer."""
+    from app.db import store
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    rows = store.get_scan_log_last_24h(conn)
+
+    if not rows:
+        print("No arb opportunities logged in the last 24 hours.")
+        return
+
+    header = (
+        f"{'ts':<26}  {'event_title':<40}  {'legs':>4}  "
+        f"{'gross':>6}  {'net':>6}  {'dominant':<9}  {'shares':>12}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for r in rows:
+        title = (r.event_title[:37] + "...") if len(r.event_title) > 40 else r.event_title
+        print(
+            f"{r.ts:<26}  {title:<40}  {r.leg_count:>4}  "
+            f"{r.gross_edge_bps:>6}  {r.net_edge_bps:>6}  "
+            f"{r.dominant_cost:<9}  {str(r.optimal_shares):>12}"
+        )
+
+    print()
+    total = len(rows)
+    avg_net = sum(r.net_edge_bps for r in rows) // total
+    cost_counts: dict[str, int] = {}
+    for r in rows:
+        cost_counts[r.dominant_cost] = cost_counts.get(r.dominant_cost, 0) + 1
+    dist = "  ".join(
+        f"{k}: {v * 100 // total}%"
+        for k, v in sorted(cost_counts.items())
+    )
+    print(f"Total last 24h: {total}  |  avg net_edge_bps: {avg_net}  |  dominant_cost: {dist}")
+
+
 def cmd_loop(
     cfg: object,
     interval: int = 60,
@@ -279,6 +376,7 @@ def cmd_loop(
             exc_info=True,
         )
     last_discover_at = time.monotonic()
+    cycle_count = 0
 
     try:
         while not stop.is_set():
@@ -306,10 +404,24 @@ def cmd_loop(
 
                 # Snapshot round always runs, even if discover above failed
                 stored = cmd_snapshot(cfg, top=top, by=by)
+                cycle_count += 1
                 _log.info(
                     "loop_cycle_complete",
                     extra={"snapshots_stored": stored, "sleep_sec": interval},
                 )
+
+                # Arb scan every _SCAN_EVERY cycles; isolated so it cannot
+                # interrupt the sleep or cause the loop to exit.
+                if cycle_count % _SCAN_EVERY == 0:
+                    try:
+                        found = cmd_scan(cfg)
+                        _log.info("loop_scan_complete", extra={"opps_found": found})
+                    except Exception as scan_exc:
+                        _log.error(
+                            "loop_scan_error",
+                            extra={"error": str(scan_exc)},
+                            exc_info=True,
+                        )
 
             except Exception as exc:
                 _log.error(
@@ -350,6 +462,8 @@ def main() -> None:
     )
 
     sub.add_parser("stats", help="Print database statistics")
+    sub.add_parser("scan", help="Scan latest snapshots for NegRisk arb opportunities")
+    sub.add_parser("scan-log", help="Print last 24 h of arb scan results")
 
     bt_parser = sub.add_parser("backtest", help="Run backtest on stored snapshots")
     bt_parser.add_argument("--start", required=True, help="Start timestamp ISO 8601")
@@ -385,6 +499,10 @@ def main() -> None:
         cmd_snapshot(cfg, top=args.top, by=args.by)
     elif args.command == "stats":
         cmd_stats(cfg)
+    elif args.command == "scan":
+        cmd_scan(cfg)
+    elif args.command == "scan-log":
+        cmd_scan_log(cfg)
     elif args.command == "backtest":
         cmd_backtest(cfg, args.start, args.end)
     elif args.command == "loop":

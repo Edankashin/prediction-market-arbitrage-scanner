@@ -144,3 +144,22 @@ class DataApiPositionRow:
     unrealized_pnl: Decimal | None
     fetched_at: str
     id: int | None = None
+
+
+@dataclass(frozen=True)
+class ScanLogRow:
+    """One arb opportunity recorded by the NegRisk scanner."""
+
+    ts: str                          # snapshot ts, SQLite-comparable UTC (space separator)
+    discovered_at: str               # wall clock when the scan ran
+    event_id: str
+    event_title: str
+    leg_count: int
+    gross_edge_bps: int
+    net_edge_bps: int
+    dominant_cost: str               # 'fee' | 'slippage' | 'gas'
+    total_cost_usdc: Decimal
+    guaranteed_payoff_usdc: Decimal
+    optimal_shares: Decimal
+    legs_json: str                   # JSON list of ArbLeg field dicts
+    id: int | None = None

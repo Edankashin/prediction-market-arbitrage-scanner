@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from app.models import (
     BookLevel,
@@ -18,9 +19,13 @@ from app.models import (
     MarketRow,
     PortfolioSnapshotRow,
     PositionRow,
+    ScanLogRow,
     SnapshotRow,
     TradeRow,
 )
+
+if TYPE_CHECKING:
+    from app.strategies.negrisk_scanner import ArbOpportunity
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +50,35 @@ def _levels_to_json(levels: list[BookLevel]) -> str:
 
 def _json_to_levels(raw: str) -> list[BookLevel]:
     return [BookLevel(price=Decimal(d["price"]), size=Decimal(d["size"])) for d in json.loads(raw)]
+
+
+def _to_sqlite_ts(ts: str) -> str:
+    """Normalize any ISO 8601 UTC ts → SQLite-comparable format (space separator, no tz offset).
+
+    SQLite's datetime('now', ...) produces '2026-05-15 22:39:35' (no T, no offset).
+    Stored scan_log.ts must use the same format for WHERE ts >= datetime(...) to
+    compare correctly as plain text.
+    """
+    return datetime.fromisoformat(ts).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def _arb_legs_to_json(legs: tuple) -> str:  # tuple[ArbLeg, ...]
+    return json.dumps([
+        {
+            "condition_id": leg.condition_id,
+            "token_id": leg.token_id,
+            "side": leg.side,
+            "best_ask": str(leg.best_ask),
+            "avg_fill_price": str(leg.avg_fill_price),
+            "fill_shares": str(leg.fill_shares),
+            "fee_bps": leg.fee_bps,
+            "fee_usdc": str(leg.fee_usdc),
+            "slippage_bps": str(leg.slippage_bps),
+            "slippage_usdc": str(leg.slippage_usdc),
+            "gas_usdc": str(leg.gas_usdc),
+        }
+        for leg in legs
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -548,3 +582,106 @@ def get_data_api_positions(
         )
         for row in cur.fetchall()
     ]
+
+
+# ---------------------------------------------------------------------------
+# book_snapshots — live-scan query
+# ---------------------------------------------------------------------------
+
+def get_latest_snapshots_in_window(
+    conn: sqlite3.Connection,
+    window_sec: int = 90,
+) -> list[SnapshotRow]:
+    """Most recent snapshot per token whose ts falls within the last window_sec seconds.
+
+    Uses a Python-computed isoformat cutoff so the comparison is in the same
+    format as book_snapshots.ts (isoformat with T-separator and +00:00 offset).
+    Returns one row per token — the most recent within the window.
+    """
+    cutoff = (datetime.now(tz=timezone.utc) - timedelta(seconds=window_sec)).isoformat()
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        """
+        SELECT bs.*
+        FROM book_snapshots bs
+        INNER JOIN (
+            SELECT token_id, MAX(ts) AS max_ts
+            FROM book_snapshots
+            WHERE ts >= ?
+            GROUP BY token_id
+        ) latest ON bs.token_id = latest.token_id AND bs.ts = latest.max_ts
+        """,
+        (cutoff,),
+    )
+    return [_snap_from_row(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# scan_log
+# ---------------------------------------------------------------------------
+
+def insert_scan_log_entry(
+    conn: sqlite3.Connection,
+    opp: ArbOpportunity,
+    event_title: str,
+) -> None:
+    """Serialize an ArbOpportunity and append it to scan_log."""
+    conn.execute(
+        """
+        INSERT INTO scan_log (
+            ts, discovered_at, event_id, event_title, leg_count,
+            gross_edge_bps, net_edge_bps, dominant_cost,
+            total_cost_usdc, guaranteed_payoff_usdc, optimal_shares, legs_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            _to_sqlite_ts(opp.ts),
+            _to_sqlite_ts(_now()),
+            opp.event_id,
+            event_title,
+            len(opp.legs),
+            opp.gross_edge_bps,
+            opp.net_edge_bps,
+            opp.dominant_cost,
+            str(opp.total_cost_usdc),
+            str(opp.guaranteed_payoff_usdc),
+            str(opp.optimal_shares),
+            _arb_legs_to_json(opp.legs),
+        ),
+    )
+    conn.commit()
+
+
+def get_scan_log_last_24h(conn: sqlite3.Connection) -> list[ScanLogRow]:
+    """All scan_log rows whose ts is within the last 24 hours, newest first.
+
+    Uses SQLite's datetime('now', '-24 hours') so the cutoff is computed
+    server-side in the same format as stored ts values.
+    """
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        """
+        SELECT * FROM scan_log
+        WHERE ts >= datetime('now', '-24 hours')
+        ORDER BY ts DESC
+        """
+    )
+    return [_scan_log_from_row(r) for r in cur.fetchall()]
+
+
+def _scan_log_from_row(row: sqlite3.Row) -> ScanLogRow:
+    return ScanLogRow(
+        id=row["id"],
+        ts=row["ts"],
+        discovered_at=row["discovered_at"],
+        event_id=row["event_id"],
+        event_title=row["event_title"],
+        leg_count=row["leg_count"],
+        gross_edge_bps=row["gross_edge_bps"],
+        net_edge_bps=row["net_edge_bps"],
+        dominant_cost=row["dominant_cost"],
+        total_cost_usdc=Decimal(row["total_cost_usdc"]),
+        guaranteed_payoff_usdc=Decimal(row["guaranteed_payoff_usdc"]),
+        optimal_shares=Decimal(row["optimal_shares"]),
+        legs_json=row["legs_json"],
+    )
