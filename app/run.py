@@ -9,6 +9,11 @@ Usage (from repo root):
     python -m app.run scan-log
     python -m app.run kalshi-discover
     python -m app.run kalshi-snapshot [--top N] [--by volume_desc|volume_asc|recent]
+    python -m app.run match-search <query> [--top N]
+    python -m app.run match-candidates --pm-condition-id <id>|--kalshi-ticker <ticker> [--top N]
+    python -m app.run match-confirm --pm-condition-id <id> --kalshi-ticker <ticker> --note "<text>"
+    python -m app.run match-reject --pair-id <id> --reason "<text>"
+    python -m app.run match-list [--status confirmed|rejected|all]
     python -m app.run backtest --start 2026-05-01T00:00:00 --end 2026-05-14T00:00:00
     python -m app.run loop [--interval 60] [--top 50] [--by volume_24h] [--discover-every 900]
 """
@@ -388,6 +393,242 @@ def cmd_kalshi_snapshot(
     return stored
 
 
+def cmd_match_search(cfg: object, query: str, top: int = 20) -> None:  # type: ignore[type-arg]
+    """Search PM markets by keyword and rank by Jaccard token overlap."""
+    from app.db import schema
+    from app.matching.search import search_pm
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+
+    conn.row_factory = __import__("sqlite3").Row
+    pm_rows = [
+        (r["condition_id"], r["question"] or "", r["event_title"], r["end_date"])
+        for r in conn.execute(
+            "SELECT condition_id, question, event_title, end_date FROM markets"
+            " WHERE active=1 AND closed=0"
+        ).fetchall()
+    ]
+
+    results = search_pm(query, pm_rows, top=top)
+    if not results:
+        print("No matches found.")
+        return
+
+    header = f"{'#':>3}  {'score':>5}  {'end_date':<12}  {'condition_id':<45}  question"
+    print(header)
+    print("-" * min(len(header) + 60, 160))
+    for i, r in enumerate(results, 1):
+        ed = (r["end_date"] or "")[:10]
+        q = (r["question"] or "")
+        q_display = (q[:70] + "…") if len(q) > 71 else q
+        print(f"{i:>3}  {r['score']:>5.3f}  {ed:<12}  {r['condition_id']:<45}  {q_display}")
+
+
+def cmd_match_candidates(
+    cfg: object,
+    pm_condition_id: str | None = None,
+    kalshi_ticker: str | None = None,
+    top: int = 20,
+) -> None:  # type: ignore[type-arg]
+    """Find cross-platform candidates using Jaccard ranking.
+
+    Exactly one of pm_condition_id or kalshi_ticker must be supplied.
+    """
+    import sqlite3 as _sqlite3
+
+    from app.db import schema
+    from app.matching.search import candidates_from_kalshi, candidates_from_pm
+
+    if (pm_condition_id is None) == (kalshi_ticker is None):
+        print("Error: supply exactly one of --pm-condition-id or --kalshi-ticker.")
+        return
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+    conn.row_factory = _sqlite3.Row
+
+    if pm_condition_id is not None:
+        src = conn.execute(
+            "SELECT question, event_title, end_date FROM markets WHERE condition_id=?",
+            (pm_condition_id,),
+        ).fetchone()
+        if src is None:
+            print(f"PM market not found: {pm_condition_id}")
+            return
+        pm_q, pm_et, pm_ed = src["question"] or "", src["event_title"], src["end_date"]
+
+        kalshi_rows = [
+            (r["ticker"], r["title"] or "", r["end_date"])
+            for r in conn.execute(
+                "SELECT ticker, title, end_date FROM kalshi_markets WHERE status='active'"
+            ).fetchall()
+        ]
+        results = candidates_from_pm(pm_q, pm_et, pm_ed, kalshi_rows, top=top)
+
+        q_display = (pm_q[:72] + "…") if len(pm_q) > 73 else pm_q
+        ed_display = (pm_ed or "")[:10]
+        print(f"\nCandidates for PM: \"{q_display}\" [{ed_display}]")
+        print(f"(condition_id: {pm_condition_id})\n")
+
+        header = f"{'#':>3}  {'score':>5}  {'days':>5}  {'end_date':<12}  {'ticker':<35}  title"
+        print(header)
+        print("-" * min(len(header) + 50, 160))
+        for i, r in enumerate(results, 1):
+            ed = (r["end_date"] or "")[:10]
+            t = (r["title"] or "")
+            t_display = (t[:55] + "…") if len(t) > 56 else t
+            days = r["days_diff"] if r["days_diff"] < 99_999 else "sentinel"
+            print(f"{i:>3}  {r['score']:>5.3f}  {str(days):>5}  {ed:<12}  {r['ticker']:<35}  {t_display}")
+        print()
+        for i, r in enumerate(results, 1):
+            print(
+                f"  #{i}: python -m app.run match-confirm"
+                f" --pm-condition-id {pm_condition_id}"
+                f" --kalshi-ticker {r['ticker']}"
+                f' --note ""'
+            )
+
+    else:
+        src = conn.execute(
+            "SELECT title, end_date FROM kalshi_markets WHERE ticker=?",
+            (kalshi_ticker,),
+        ).fetchone()
+        if src is None:
+            print(f"Kalshi market not found: {kalshi_ticker}")
+            return
+        k_title, k_ed = src["title"] or "", src["end_date"]
+
+        pm_rows = [
+            (r["condition_id"], r["question"] or "", r["event_title"], r["end_date"])
+            for r in conn.execute(
+                "SELECT condition_id, question, event_title, end_date FROM markets"
+                " WHERE active=1 AND closed=0"
+            ).fetchall()
+        ]
+        results = candidates_from_kalshi(k_title, k_ed, pm_rows, top=top)
+
+        t_display = (k_title[:72] + "…") if len(k_title) > 73 else k_title
+        ed_display = (k_ed or "")[:10]
+        print(f"\nCandidates for Kalshi: \"{t_display}\" [{ed_display}]")
+        print(f"(ticker: {kalshi_ticker})\n")
+
+        header = f"{'#':>3}  {'score':>5}  {'days':>5}  {'end_date':<12}  {'condition_id':<45}  question"
+        print(header)
+        print("-" * min(len(header) + 50, 160))
+        for i, r in enumerate(results, 1):
+            ed = (r["end_date"] or "")[:10]
+            q = (r["question"] or "")
+            q_display = (q[:50] + "…") if len(q) > 51 else q
+            days = r["days_diff"] if r["days_diff"] < 99_999 else "sentinel"
+            print(f"{i:>3}  {r['score']:>5.3f}  {str(days):>5}  {ed:<12}  {r['condition_id']:<45}  {q_display}")
+        print()
+        for i, r in enumerate(results, 1):
+            print(
+                f"  #{i}: python -m app.run match-confirm"
+                f" --pm-condition-id {r['condition_id']}"
+                f" --kalshi-ticker {kalshi_ticker}"
+                f' --note ""'
+            )
+
+
+def cmd_match_confirm(
+    cfg: object,
+    pm_condition_id: str,
+    kalshi_ticker: str,
+    note: str,
+) -> None:  # type: ignore[type-arg]
+    """Confirm a PM ↔ Kalshi pair and store an audit snapshot."""
+    import sqlite3 as _sqlite3
+
+    from app.db import schema
+    from app.matching.pairs import insert_pair
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+    conn.row_factory = _sqlite3.Row
+
+    pm = conn.execute(
+        "SELECT question, end_date FROM markets WHERE condition_id=?",
+        (pm_condition_id,),
+    ).fetchone()
+    if pm is None:
+        print(f"Error: PM market not found: {pm_condition_id}")
+        return
+
+    kalshi = conn.execute(
+        "SELECT title, end_date FROM kalshi_markets WHERE ticker=?",
+        (kalshi_ticker,),
+    ).fetchone()
+    if kalshi is None:
+        print(f"Error: Kalshi market not found: {kalshi_ticker}")
+        return
+
+    try:
+        pair_id = insert_pair(
+            conn,
+            pm_condition_id=pm_condition_id,
+            kalshi_ticker=kalshi_ticker,
+            note=note,
+            pm_question_snapshot=pm["question"] or "",
+            pm_end_date_snapshot=pm["end_date"],
+            kalshi_title_snapshot=kalshi["title"] or "",
+            kalshi_end_date_snapshot=kalshi["end_date"],
+        )
+        print(f"Confirmed pair #{pair_id}:")
+        print(f"  PM:     {pm['question']}")
+        print(f"  Kalshi: {kalshi['title']}")
+        print(f"  Note:   {note}")
+    except _sqlite3.IntegrityError:
+        print(
+            f"Error: pair ({pm_condition_id}, {kalshi_ticker}) already exists."
+            " Check match-list --status all."
+        )
+
+
+def cmd_match_reject(cfg: object, pair_id: int, reason: str) -> None:  # type: ignore[type-arg]
+    """Reject a confirmed pair (kept for audit, never deleted)."""
+    from app.db import schema
+    from app.matching.pairs import reject_pair
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+
+    updated = reject_pair(conn, pair_id, reason)
+    if updated:
+        print(f"Pair #{pair_id} rejected.")
+    else:
+        print(f"Error: pair #{pair_id} not found.")
+
+
+def cmd_match_list(cfg: object, status: str | None = None) -> None:  # type: ignore[type-arg]
+    """List confirmed (or all) cross-platform pairs."""
+    from app.db import schema
+    from app.matching.pairs import list_pairs
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+
+    filter_status = None if status == "all" else status
+    rows = list_pairs(conn, status=filter_status)
+
+    if not rows:
+        print("No pairs found.")
+        return
+
+    for r in rows:
+        flag = "[REJECTED]" if r.status == "rejected" else "[OK]"
+        pm_q = (r.pm_question_snapshot[:60] + "…") if len(r.pm_question_snapshot) > 61 else r.pm_question_snapshot
+        k_t = (r.kalshi_title_snapshot[:60] + "…") if len(r.kalshi_title_snapshot) > 61 else r.kalshi_title_snapshot
+        print(
+            f"#{r.id} {flag}\n"
+            f"  PM     [{(r.pm_end_date_snapshot or '')[:10]}]: {pm_q}\n"
+            f"  Kalshi [{(r.kalshi_end_date_snapshot or '')[:10]}]: {k_t}\n"
+            f"  Note: {r.note}\n"
+        )
+    print(f"Total: {len(rows)}")
+
+
 def cmd_scan_log(cfg: object) -> None:  # type: ignore[type-arg]
     """Print the last 24 h of scan_log entries with a summary footer."""
     from app.db import store
@@ -614,6 +855,32 @@ def main() -> None:
         help="Sort key for market selection (default: volume_desc)",
     )
 
+    ms_parser = sub.add_parser("match-search", help="Search PM markets by keyword")
+    ms_parser.add_argument("query", help="Free-text search query")
+    ms_parser.add_argument("--top", type=int, default=20, help="Max results (default: 20)")
+
+    mc_parser = sub.add_parser(
+        "match-candidates", help="Find cross-platform candidates for a given market"
+    )
+    mc_group = mc_parser.add_mutually_exclusive_group(required=True)
+    mc_group.add_argument("--pm-condition-id", help="Search Kalshi for this PM market")
+    mc_group.add_argument("--kalshi-ticker", help="Search PM for this Kalshi market")
+    mc_parser.add_argument("--top", type=int, default=20, help="Max results (default: 20)")
+
+    mconf_parser = sub.add_parser("match-confirm", help="Confirm a PM ↔ Kalshi pair")
+    mconf_parser.add_argument("--pm-condition-id", required=True)
+    mconf_parser.add_argument("--kalshi-ticker", required=True)
+    mconf_parser.add_argument("--note", required=True, help="Resolution rule comparison (required)")
+
+    mrej_parser = sub.add_parser("match-reject", help="Reject a confirmed pair (kept for audit)")
+    mrej_parser.add_argument("--pair-id", required=True, type=int)
+    mrej_parser.add_argument("--reason", required=True)
+
+    mlist_parser = sub.add_parser("match-list", help="List cross-platform pairs")
+    mlist_parser.add_argument(
+        "--status", choices=["confirmed", "rejected", "all"], default="confirmed"
+    )
+
     bt_parser = sub.add_parser("backtest", help="Run backtest on stored snapshots")
     bt_parser.add_argument("--start", required=True, help="Start timestamp ISO 8601")
     bt_parser.add_argument("--end", required=True, help="End timestamp ISO 8601")
@@ -656,6 +923,21 @@ def main() -> None:
         cmd_kalshi_discover(cfg)
     elif args.command == "kalshi-snapshot":
         cmd_kalshi_snapshot(cfg, top=args.top, by=args.by)
+    elif args.command == "match-search":
+        cmd_match_search(cfg, args.query, top=args.top)
+    elif args.command == "match-candidates":
+        cmd_match_candidates(
+            cfg,
+            pm_condition_id=args.pm_condition_id,
+            kalshi_ticker=args.kalshi_ticker,
+            top=args.top,
+        )
+    elif args.command == "match-confirm":
+        cmd_match_confirm(cfg, args.pm_condition_id, args.kalshi_ticker, args.note)
+    elif args.command == "match-reject":
+        cmd_match_reject(cfg, args.pair_id, args.reason)
+    elif args.command == "match-list":
+        cmd_match_list(cfg, status=args.status)
     elif args.command == "backtest":
         cmd_backtest(cfg, args.start, args.end)
     elif args.command == "loop":

@@ -241,6 +241,32 @@ CREATE INDEX IF NOT EXISTS idx_kalshi_snapshots_ticker_ts
     ON kalshi_book_snapshots(ticker, ts)
 """
 
+_CROSS_PLATFORM_PAIRS = """
+CREATE TABLE IF NOT EXISTS cross_platform_pairs (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    pm_condition_id          TEXT NOT NULL,
+    kalshi_ticker            TEXT NOT NULL,
+    status                   TEXT NOT NULL DEFAULT 'confirmed'
+                             CHECK(status IN ('confirmed', 'rejected')),
+    note                     TEXT NOT NULL DEFAULT '',
+    pm_question_snapshot     TEXT NOT NULL,
+    pm_end_date_snapshot     TEXT,
+    kalshi_title_snapshot    TEXT NOT NULL,
+    kalshi_end_date_snapshot TEXT,
+    confirmed_at             TEXT NOT NULL,
+    rejected_at              TEXT,
+    rejected_reason          TEXT,
+    UNIQUE(pm_condition_id, kalshi_ticker),
+    FOREIGN KEY (pm_condition_id) REFERENCES markets(condition_id),
+    FOREIGN KEY (kalshi_ticker)   REFERENCES kalshi_markets(ticker)
+)
+"""
+
+_IDX_PAIRS_STATUS = """
+CREATE INDEX IF NOT EXISTS idx_pairs_status_pm
+    ON cross_platform_pairs(status, pm_condition_id)
+"""
+
 _SCHEMA_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER NOT NULL,
@@ -272,10 +298,12 @@ _ALL_DDL = [
     _IDX_KALSHI_MARKETS_STATUS,
     _KALSHI_BOOK_SNAPSHOTS,
     _IDX_KALSHI_SNAP_TICKER_TS,
+    _CROSS_PLATFORM_PAIRS,
+    _IDX_PAIRS_STATUS,
     _SCHEMA_VERSION,
 ]
 
-CURRENT_VERSION = 3
+CURRENT_VERSION = 4
 
 
 def migrate(conn: sqlite3.Connection) -> None:

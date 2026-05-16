@@ -105,7 +105,7 @@ def test_migrate_idempotent(mem_db: sqlite3.Connection) -> None:
 
 def test_schema_version_set(mem_db: sqlite3.Connection) -> None:
     cur = mem_db.execute("SELECT version FROM schema_version")
-    assert cur.fetchone()[0] == 3
+    assert cur.fetchone()[0] == 4
 
 
 # ---------------------------------------------------------------------------

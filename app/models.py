@@ -193,3 +193,21 @@ class KalshiSnapshotRow:
     best_no_ask: Decimal | None   # = 1 − best_yes_bid
     single_sided: bool
     id: int | None = None
+
+
+@dataclass(frozen=True)
+class CrossPlatformPairRow:
+    """One confirmed (or rejected) PM ↔ Kalshi market pair."""
+
+    pm_condition_id: str
+    kalshi_ticker: str
+    status: str              # 'confirmed' | 'rejected'
+    note: str
+    pm_question_snapshot: str    # PM question text captured at confirmation time
+    pm_end_date_snapshot: str | None
+    kalshi_title_snapshot: str   # Kalshi title captured at confirmation time
+    kalshi_end_date_snapshot: str | None
+    confirmed_at: str        # ISO 8601 UTC
+    rejected_at: str | None
+    rejected_reason: str | None
+    id: int | None = None
