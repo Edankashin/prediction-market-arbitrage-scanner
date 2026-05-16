@@ -45,8 +45,8 @@ interval_sec = 30
 
 [kalshi]
 base_url             = "https://external-api.kalshi.com/trade-api/v2"
-requests_per_second  = 1.0
+requests_per_second  = 2.0   # 0.5s between calls; fast enough, avoids 429
 timeout_sec          = 15
-max_retries          = 3
+max_retries          = 1     # 1 retry on transient errors; 429 fast-fails immediately
 backoff_factor       = 1.0
 kalshi_top           = 100

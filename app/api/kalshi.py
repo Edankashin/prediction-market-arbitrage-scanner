@@ -160,6 +160,9 @@ class KalshiClient:
     # ------------------------------------------------------------------
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        # Enforce caller-configured rate limit between every outgoing request.
+        time.sleep(1.0 / self._cfg.requests_per_second)
+
         url = self._cfg.base_url.rstrip("/") + path
         for attempt in range(self._cfg.max_retries + 1):
             try:
@@ -168,6 +171,23 @@ class KalshiClient:
                 )
                 resp.raise_for_status()
                 return resp.json()  # type: ignore[no-any-return]
+            except requests.HTTPError as exc:
+                # 429 Too Many Requests: raise immediately — retrying would
+                # only deepen the rate-limit hole. Callers should skip and move on.
+                if exc.response is not None and exc.response.status_code == 429:
+                    _log.warning(
+                        "kalshi_rate_limited",
+                        extra={"path": path, "status": 429},
+                    )
+                    raise
+                if attempt == self._cfg.max_retries:
+                    raise
+                backoff = self._cfg.backoff_factor * (2 ** attempt)
+                _log.warning(
+                    "kalshi_http_retry",
+                    extra={"path": path, "attempt": attempt + 1, "backoff": backoff},
+                )
+                time.sleep(backoff)
             except requests.RequestException as exc:
                 if attempt == self._cfg.max_retries:
                     raise

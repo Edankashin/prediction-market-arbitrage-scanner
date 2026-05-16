@@ -23,6 +23,7 @@ def _client() -> KalshiClient:
     cfg.timeout_sec = 15
     cfg.max_retries = 3
     cfg.backoff_factor = 1.0
+    cfg.requests_per_second = 999.0  # effectively no sleep in tests
     return KalshiClient(cfg)
 
 

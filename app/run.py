@@ -294,8 +294,11 @@ def cmd_kalshi_discover(cfg: object) -> int:  # type: ignore[type-arg]
 
     Two-level fetch: events endpoint does not include nested markets, so each
     event requires a separate /markets?event_ticker=X call.
-    Returns number of markets stored.
+    Returns number of markets stored.  Returns 0 if cfg.kalshi is absent.
     """
+    if not hasattr(cfg, "kalshi"):
+        return 0
+
     from datetime import datetime, timezone
 
     from app.api.kalshi import KalshiClient
@@ -337,8 +340,12 @@ def cmd_kalshi_snapshot(
     """Fetch one round of Kalshi orderbook snapshots.
 
     Markets are sorted by `by` and capped at `top` before fetch.
-    Returns number of snapshots stored.
+    When `top` is None, falls back to cfg.kalshi.kalshi_top (if present).
+    Returns number of snapshots stored.  Returns 0 if cfg.kalshi is absent.
     """
+    if not hasattr(cfg, "kalshi"):
+        return 0
+
     from app.api.kalshi import KalshiClient
     from app.db import schema, store
 
@@ -354,6 +361,11 @@ def cmd_kalshi_snapshot(
         markets.sort(key=lambda m: (m.volume is not None, m.volume or Decimal("0")))
     elif by == "recent":
         markets.sort(key=lambda m: m.synced_at, reverse=True)
+
+    # Resolve top: explicit arg wins; fall back to cfg.kalshi.kalshi_top.
+    if top is None:
+        kalshi_cfg = getattr(cfg, "kalshi", None)
+        top = getattr(kalshi_cfg, "kalshi_top", None)
 
     if top is not None:
         markets = markets[:top]
@@ -511,11 +523,8 @@ def cmd_loop(
                 # Snapshot round always runs, even if discover above failed
                 stored = cmd_snapshot(cfg, top=top, by=by)
 
-                # Kalshi snapshot round
-                k_stored = cmd_kalshi_snapshot(
-                    cfg,
-                    top=cfg.kalshi.kalshi_top,  # type: ignore[attr-defined]
-                )
+                # Kalshi snapshot round (top resolved inside cmd_kalshi_snapshot)
+                k_stored = cmd_kalshi_snapshot(cfg)
 
                 cycle_count += 1
 
