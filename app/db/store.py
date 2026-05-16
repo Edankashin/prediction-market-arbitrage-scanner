@@ -166,6 +166,13 @@ def get_active_markets(conn: sqlite3.Connection) -> list[MarketRow]:
     return [_market_from_row(r) for r in cur.fetchall()]
 
 
+def get_all_markets(conn: sqlite3.Connection) -> list[MarketRow]:
+    """Fetch every market row regardless of active/closed/archived state."""
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute("SELECT * FROM markets")
+    return [_market_from_row(r) for r in cur.fetchall()]
+
+
 def get_neg_risk_markets_for_event(
     conn: sqlite3.Connection, event_id: str
 ) -> list[MarketRow]:
@@ -624,8 +631,14 @@ def insert_scan_log_entry(
     conn: sqlite3.Connection,
     opp: ArbOpportunity,
     event_title: str,
+    *,
+    discovered_at: str | None = None,
 ) -> None:
-    """Serialize an ArbOpportunity and append it to scan_log."""
+    """Serialize an ArbOpportunity and append it to scan_log.
+
+    discovered_at: pass 'BACKFILL' for backfill rows; None uses current UTC time.
+    """
+    da = discovered_at if discovered_at is not None else _to_sqlite_ts(_now())
     conn.execute(
         """
         INSERT INTO scan_log (
@@ -636,7 +649,7 @@ def insert_scan_log_entry(
         """,
         (
             _to_sqlite_ts(opp.ts),
-            _to_sqlite_ts(_now()),
+            da,
             opp.event_id,
             event_title,
             len(opp.legs),
@@ -685,3 +698,32 @@ def _scan_log_from_row(row: sqlite3.Row) -> ScanLogRow:
         optimal_shares=Decimal(row["optimal_shares"]),
         legs_json=row["legs_json"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Backfill helpers
+# ---------------------------------------------------------------------------
+
+def get_all_negrisk_snapshots(
+    conn: sqlite3.Connection,
+) -> list[tuple[SnapshotRow, str, str]]:
+    """All book_snapshots for NegRisk markets, with event metadata.
+
+    Returns list of (SnapshotRow, event_id, event_title) ordered by ts ascending.
+    Used by scripts/backfill_scan_log.py.
+    """
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        """
+        SELECT bs.*, m.event_id AS m_event_id, m.event_title AS m_event_title
+        FROM book_snapshots bs
+        JOIN markets m ON bs.condition_id = m.condition_id
+        WHERE m.neg_risk = 1 AND m.event_id IS NOT NULL
+        ORDER BY bs.ts ASC
+        """
+    )
+    result = []
+    for row in cur.fetchall():
+        snap = _snap_from_row(row)
+        result.append((snap, row["m_event_id"], row["m_event_title"] or ""))
+    return result
