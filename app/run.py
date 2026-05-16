@@ -7,6 +7,8 @@ Usage (from repo root):
     python -m app.run stats
     python -m app.run scan
     python -m app.run scan-log
+    python -m app.run kalshi-discover
+    python -m app.run kalshi-snapshot [--top N] [--by volume_desc|volume_asc|recent]
     python -m app.run backtest --start 2026-05-01T00:00:00 --end 2026-05-14T00:00:00
     python -m app.run loop [--interval 60] [--top 50] [--by volume_24h] [--discover-every 900]
 """
@@ -29,6 +31,7 @@ from app.utils.helpers import configure_logging
 _log = logging.getLogger(__name__)
 
 _BY_CHOICES = ["volume_24h", "liquidity", "spread"]
+_BY_KALSHI_CHOICES = ["volume_desc", "volume_asc", "recent"]
 _SCAN_EVERY = 5  # run cmd_scan every N snapshot cycles inside the loop
 
 # ---------------------------------------------------------------------------
@@ -286,6 +289,93 @@ def cmd_scan(cfg: object) -> int:  # type: ignore[type-arg]
     return opps_found
 
 
+def cmd_kalshi_discover(cfg: object) -> int:  # type: ignore[type-arg]
+    """Fetch all open Kalshi events+markets and upsert to kalshi_markets table.
+
+    Two-level fetch: events endpoint does not include nested markets, so each
+    event requires a separate /markets?event_ticker=X call.
+    Returns number of markets stored.
+    """
+    from datetime import datetime, timezone
+
+    from app.api.kalshi import KalshiClient
+    from app.db import schema, store
+
+    kalshi = KalshiClient(cfg.kalshi)  # type: ignore[attr-defined]
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+
+    synced_at = datetime.now(tz=timezone.utc).isoformat()
+    events = kalshi.get_all_open_events()
+
+    count = 0
+    for event in events:
+        event_ticker = event.get("event_ticker", "")
+        category = event.get("category")
+        try:
+            markets = kalshi.get_markets_for_event(event_ticker)
+        except Exception as exc:
+            _log.warning(
+                "kalshi_discover_event_error",
+                extra={"event_ticker": event_ticker, "error": str(exc)},
+            )
+            continue
+        for mkt_raw in markets:
+            row = kalshi.parse_market_row(mkt_raw, category, synced_at)
+            store.upsert_kalshi_market(conn, row)
+            count += 1
+
+    _log.info("kalshi_discover_complete", extra={"markets_stored": count})
+    return count
+
+
+def cmd_kalshi_snapshot(
+    cfg: object,
+    top: int | None = None,
+    by: str = "volume_desc",
+) -> int:  # type: ignore[type-arg]
+    """Fetch one round of Kalshi orderbook snapshots.
+
+    Markets are sorted by `by` and capped at `top` before fetch.
+    Returns number of snapshots stored.
+    """
+    from app.api.kalshi import KalshiClient
+    from app.db import schema, store
+
+    kalshi = KalshiClient(cfg.kalshi)  # type: ignore[attr-defined]
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+
+    markets = store.get_active_kalshi_markets(conn)
+
+    if by == "volume_desc":
+        markets.sort(key=lambda m: (m.volume is None, -(m.volume or Decimal("0"))))
+    elif by == "volume_asc":
+        markets.sort(key=lambda m: (m.volume is not None, m.volume or Decimal("0")))
+    elif by == "recent":
+        markets.sort(key=lambda m: m.synced_at, reverse=True)
+
+    if top is not None:
+        markets = markets[:top]
+
+    stored = 0
+    for mkt in markets:
+        try:
+            raw = kalshi.get_orderbook(mkt.ticker)
+            snap = kalshi.parse_and_validate_snapshot(mkt.ticker, raw)
+            if snap is not None:
+                store.insert_kalshi_snapshot(conn, snap)
+                stored += 1
+        except Exception as exc:
+            _log.warning(
+                "kalshi_snapshot_error",
+                extra={"ticker": mkt.ticker, "error": str(exc)},
+            )
+
+    _log.info("kalshi_snapshot_complete", extra={"stored": stored})
+    return stored
+
+
 def cmd_scan_log(cfg: object) -> None:  # type: ignore[type-arg]
     """Print the last 24 h of scan_log entries with a summary footer."""
     from app.db import store
@@ -375,15 +465,23 @@ def cmd_loop(
             extra={"error": str(init_exc)},
             exc_info=True,
         )
+    try:
+        cmd_kalshi_discover(cfg)
+    except Exception as init_exc:
+        _log.error(
+            "loop_initial_kalshi_discover_error",
+            extra={"error": str(init_exc)},
+            exc_info=True,
+        )
     last_discover_at = time.monotonic()
     cycle_count = 0
 
     try:
         while not stop.is_set():
+            cycle_start = time.time()
+            sleep_sec = float(interval)  # default: full interval if cycle raises
             try:
                 # Re-discover if discover_every seconds have elapsed.
-                # Wrapped in its own try/except so a discover failure does not
-                # prevent the snapshot round from running in the same cycle.
                 elapsed = time.monotonic() - last_discover_at
                 if elapsed >= discover_every:
                     _log.info(
@@ -401,13 +499,42 @@ def cmd_loop(
                         )
                         # last_discover_at intentionally not updated so the
                         # next cycle will retry discover
+                    try:
+                        cmd_kalshi_discover(cfg)
+                    except Exception as k_exc:
+                        _log.error(
+                            "loop_kalshi_discover_error",
+                            extra={"error": str(k_exc)},
+                            exc_info=True,
+                        )
 
                 # Snapshot round always runs, even if discover above failed
                 stored = cmd_snapshot(cfg, top=top, by=by)
+
+                # Kalshi snapshot round
+                k_stored = cmd_kalshi_snapshot(
+                    cfg,
+                    top=cfg.kalshi.kalshi_top,  # type: ignore[attr-defined]
+                )
+
                 cycle_count += 1
+
+                # Wall-clock adjusted sleep: subtract work time from interval
+                cycle_elapsed = time.time() - cycle_start
+                sleep_sec = max(0.0, interval - cycle_elapsed)
+                if interval > 0 and sleep_sec == 0.0:
+                    _log.warning(
+                        "loop_cycle_overran",
+                        extra={"elapsed_sec": cycle_elapsed},
+                    )
+
                 _log.info(
                     "loop_cycle_complete",
-                    extra={"snapshots_stored": stored, "sleep_sec": interval},
+                    extra={
+                        "snapshots_stored": stored,
+                        "kalshi_snapshots_stored": k_stored,
+                        "sleep_sec": sleep_sec,
+                    },
                 )
 
                 # Arb scan every _SCAN_EVERY cycles; isolated so it cannot
@@ -431,7 +558,7 @@ def cmd_loop(
                 )
 
             # Interruptible sleep: stop.wait() returns immediately when set
-            stop.wait(interval)
+            stop.wait(sleep_sec)
 
     except KeyboardInterrupt:
         _log.info("loop_keyboard_interrupt")
@@ -464,6 +591,19 @@ def main() -> None:
     sub.add_parser("stats", help="Print database statistics")
     sub.add_parser("scan", help="Scan latest snapshots for NegRisk arb opportunities")
     sub.add_parser("scan-log", help="Print last 24 h of arb scan results")
+    sub.add_parser("kalshi-discover", help="Fetch Kalshi open markets and upsert to DB")
+
+    k_snap_parser = sub.add_parser(
+        "kalshi-snapshot", help="Take one round of Kalshi orderbook snapshots"
+    )
+    k_snap_parser.add_argument(
+        "--top", type=int, default=None,
+        help="Limit to top N markets (default: all)",
+    )
+    k_snap_parser.add_argument(
+        "--by", choices=_BY_KALSHI_CHOICES, default="volume_desc",
+        help="Sort key for market selection (default: volume_desc)",
+    )
 
     bt_parser = sub.add_parser("backtest", help="Run backtest on stored snapshots")
     bt_parser.add_argument("--start", required=True, help="Start timestamp ISO 8601")
@@ -503,6 +643,10 @@ def main() -> None:
         cmd_scan(cfg)
     elif args.command == "scan-log":
         cmd_scan_log(cfg)
+    elif args.command == "kalshi-discover":
+        cmd_kalshi_discover(cfg)
+    elif args.command == "kalshi-snapshot":
+        cmd_kalshi_snapshot(cfg, top=args.top, by=args.by)
     elif args.command == "backtest":
         cmd_backtest(cfg, args.start, args.end)
     elif args.command == "loop":

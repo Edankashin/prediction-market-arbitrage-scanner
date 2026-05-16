@@ -75,6 +75,16 @@ class SnapshotConfig:
 
 
 @dataclass(frozen=True)
+class KalshiConfig:
+    base_url: str
+    requests_per_second: float
+    timeout_sec: int
+    max_retries: int
+    backoff_factor: float
+    kalshi_top: int  # max markets to snapshot per cycle
+
+
+@dataclass(frozen=True)
 class Config:
     gamma: GammaConfig
     clob: ClobConfig
@@ -85,6 +95,7 @@ class Config:
     kelly: KellyConfig
     logging: LoggingConfig
     snapshot: SnapshotConfig
+    kalshi: KalshiConfig
 
 
 def load(config_path: str = "config.toml") -> Config:
@@ -107,6 +118,7 @@ def load(config_path: str = "config.toml") -> Config:
     k = raw["kelly"]
     lo = raw["logging"]
     sn = raw["snapshot"]
+    ka = raw["kalshi"]
 
     return Config(
         gamma=GammaConfig(
@@ -142,6 +154,14 @@ def load(config_path: str = "config.toml") -> Config:
         ),
         logging=LoggingConfig(level=lo["level"], log_dir=lo["log_dir"]),
         snapshot=SnapshotConfig(interval_sec=int(sn["interval_sec"])),
+        kalshi=KalshiConfig(
+            base_url=ka["base_url"],
+            requests_per_second=float(ka["requests_per_second"]),
+            timeout_sec=int(ka["timeout_sec"]),
+            max_retries=int(ka["max_retries"]),
+            backoff_factor=float(ka["backoff_factor"]),
+            kalshi_top=int(ka["kalshi_top"]),
+        ),
     )
 
 

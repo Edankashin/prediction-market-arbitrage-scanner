@@ -15,6 +15,8 @@ from app.models import (
     BookLevel,
     DataApiPositionRow,
     FeeRateRow,
+    KalshiMarketRow,
+    KalshiSnapshotRow,
     MarketRow,
     PortfolioSnapshotRow,
     PositionRow,
@@ -86,6 +88,7 @@ def test_migrate_creates_tables(mem_db: sqlite3.Connection) -> None:
         "markets", "book_snapshots", "fee_rate_cache",
         "trades", "positions", "portfolio_snapshots",
         "data_api_positions", "scan_log", "schema_version",
+        "kalshi_markets", "kalshi_book_snapshots",
     }
     assert expected.issubset(tables)
 
@@ -102,7 +105,7 @@ def test_migrate_idempotent(mem_db: sqlite3.Connection) -> None:
 
 def test_schema_version_set(mem_db: sqlite3.Connection) -> None:
     cur = mem_db.execute("SELECT version FROM schema_version")
-    assert cur.fetchone()[0] == 2
+    assert cur.fetchone()[0] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -341,3 +344,111 @@ def test_upsert_and_get_data_api_position(mem_db: sqlite3.Connection) -> None:
     assert len(rows) == 1
     assert rows[0].shares == Decimal("50")
     assert rows[0].avg_price == Decimal("0.55")
+
+
+# ---------------------------------------------------------------------------
+# kalshi_markets
+# ---------------------------------------------------------------------------
+
+def _kalshi_market(ticker: str = "KXTEST-1") -> KalshiMarketRow:
+    return KalshiMarketRow(
+        ticker=ticker,
+        event_ticker="KXTEST",
+        title="Will X happen?",
+        category="World",
+        status="active",
+        end_date="2026-12-31T00:00:00Z",
+        yes_bid=Decimal("0.45"),
+        volume=Decimal("5000"),
+        taker_fee_coeff=Decimal("0.07"),
+        synced_at="2026-05-16T12:00:00+00:00",
+    )
+
+
+def test_upsert_and_get_kalshi_market(mem_db: sqlite3.Connection) -> None:
+    m = _kalshi_market()
+    store.upsert_kalshi_market(mem_db, m)
+    rows = store.get_active_kalshi_markets(mem_db)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.ticker == "KXTEST-1"
+    assert r.event_ticker == "KXTEST"
+    assert r.yes_bid == Decimal("0.45")
+    assert r.volume == Decimal("5000")
+    assert r.taker_fee_coeff == Decimal("0.07")
+
+
+def test_kalshi_market_upsert_updates_on_conflict(mem_db: sqlite3.Connection) -> None:
+    m = _kalshi_market()
+    store.upsert_kalshi_market(mem_db, m)
+    updated = KalshiMarketRow(
+        **{**m.__dict__, "yes_bid": Decimal("0.48"), "volume": Decimal("9999")}
+    )
+    store.upsert_kalshi_market(mem_db, updated)
+    rows = store.get_active_kalshi_markets(mem_db)
+    assert len(rows) == 1
+    assert rows[0].yes_bid == Decimal("0.48")
+    assert rows[0].volume == Decimal("9999")
+
+
+def test_get_active_kalshi_markets_excludes_closed(mem_db: sqlite3.Connection) -> None:
+    store.upsert_kalshi_market(mem_db, _kalshi_market("KXOPEN"))
+    closed = KalshiMarketRow(**{**_kalshi_market("KXCLOSED").__dict__, "status": "closed"})
+    store.upsert_kalshi_market(mem_db, closed)
+    rows = store.get_active_kalshi_markets(mem_db)
+    tickers = {r.ticker for r in rows}
+    assert "KXOPEN" in tickers
+    assert "KXCLOSED" not in tickers
+
+
+# ---------------------------------------------------------------------------
+# kalshi_book_snapshots
+# ---------------------------------------------------------------------------
+
+def _kalshi_snap(ticker: str = "KXTEST-1", ts: str | None = None) -> KalshiSnapshotRow:
+    from datetime import datetime, timezone
+    actual_ts = ts if ts is not None else datetime.now(tz=timezone.utc).isoformat()
+    return KalshiSnapshotRow(
+        ticker=ticker,
+        ts=actual_ts,
+        yes_bids=[BookLevel(price=Decimal("0.55"), size=Decimal("100"))],
+        no_bids=[BookLevel(price=Decimal("0.42"), size=Decimal("150"))],
+        best_yes_ask=Decimal("0.58"),
+        best_no_ask=Decimal("0.45"),
+        single_sided=False,
+    )
+
+
+def test_insert_and_get_kalshi_snapshot(mem_db: sqlite3.Connection) -> None:
+    store.upsert_kalshi_market(mem_db, _kalshi_market())
+    snap = _kalshi_snap()  # uses datetime.now() — always within 90s window
+    store.insert_kalshi_snapshot(mem_db, snap)
+
+    rows = store.get_latest_kalshi_snapshots_in_window(mem_db, window_sec=90)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.ticker == "KXTEST-1"
+    assert r.best_yes_ask == Decimal("0.58")
+    assert r.best_no_ask == Decimal("0.45")
+    assert r.single_sided is False
+    assert len(r.yes_bids) == 1
+    assert r.yes_bids[0].price == Decimal("0.55")
+
+
+def test_kalshi_snapshot_single_sided(mem_db: sqlite3.Connection) -> None:
+    from datetime import datetime, timezone
+    store.upsert_kalshi_market(mem_db, _kalshi_market())
+    snap = KalshiSnapshotRow(
+        ticker="KXTEST-1",
+        ts=datetime.now(tz=timezone.utc).isoformat(),
+        yes_bids=[BookLevel(price=Decimal("0.55"), size=Decimal("100"))],
+        no_bids=[],
+        best_yes_ask=None,
+        best_no_ask=Decimal("0.45"),
+        single_sided=True,
+    )
+    store.insert_kalshi_snapshot(mem_db, snap)
+    rows = store.get_latest_kalshi_snapshots_in_window(mem_db, window_sec=90)
+    assert len(rows) == 1
+    assert rows[0].single_sided is True
+    assert rows[0].best_yes_ask is None

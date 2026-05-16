@@ -163,3 +163,33 @@ class ScanLogRow:
     optimal_shares: Decimal
     legs_json: str                   # JSON list of ArbLeg field dicts
     id: int | None = None
+
+
+@dataclass(frozen=True)
+class KalshiMarketRow:
+    """One row in the kalshi_markets table."""
+
+    ticker: str
+    event_ticker: str
+    title: str
+    category: str | None
+    status: str              # 'active' | 'closed' | 'settled'
+    end_date: str | None
+    yes_bid: Decimal | None
+    volume: Decimal | None
+    taker_fee_coeff: Decimal  # always Decimal("0.07") for taker
+    synced_at: str
+
+
+@dataclass(frozen=True)
+class KalshiSnapshotRow:
+    """One Kalshi orderbook snapshot for one market ticker."""
+
+    ticker: str
+    ts: str                    # ISO 8601 UTC
+    yes_bids: list[BookLevel]  # descending by price (best bid first)
+    no_bids: list[BookLevel]   # descending by price (best bid first)
+    best_yes_ask: Decimal | None  # = 1 − best_no_bid
+    best_no_ask: Decimal | None   # = 1 − best_yes_bid
+    single_sided: bool
+    id: int | None = None

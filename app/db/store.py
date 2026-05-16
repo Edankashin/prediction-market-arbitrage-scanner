@@ -16,6 +16,8 @@ from app.models import (
     BookLevel,
     DataApiPositionRow,
     FeeRateRow,
+    KalshiMarketRow,
+    KalshiSnapshotRow,
     MarketRow,
     PortfolioSnapshotRow,
     PositionRow,
@@ -697,6 +699,125 @@ def _scan_log_from_row(row: sqlite3.Row) -> ScanLogRow:
         guaranteed_payoff_usdc=Decimal(row["guaranteed_payoff_usdc"]),
         optimal_shares=Decimal(row["optimal_shares"]),
         legs_json=row["legs_json"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Backfill helpers
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# kalshi_markets
+# ---------------------------------------------------------------------------
+
+def upsert_kalshi_market(conn: sqlite3.Connection, row: KalshiMarketRow) -> None:
+    """Insert or replace a Kalshi market row."""
+    conn.execute(
+        """
+        INSERT INTO kalshi_markets (
+            ticker, event_ticker, title, category, status,
+            end_date, yes_bid, volume, taker_fee_coeff, synced_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(ticker) DO UPDATE SET
+            event_ticker=excluded.event_ticker,
+            title=excluded.title,
+            category=excluded.category,
+            status=excluded.status,
+            end_date=excluded.end_date,
+            yes_bid=excluded.yes_bid,
+            volume=excluded.volume,
+            taker_fee_coeff=excluded.taker_fee_coeff,
+            synced_at=excluded.synced_at
+        """,
+        (
+            row.ticker, row.event_ticker, row.title, row.category, row.status,
+            row.end_date, _s(row.yes_bid), _s(row.volume), str(row.taker_fee_coeff),
+            row.synced_at,
+        ),
+    )
+    conn.commit()
+
+
+def get_active_kalshi_markets(conn: sqlite3.Connection) -> list[KalshiMarketRow]:
+    """Fetch all Kalshi markets with status='active'."""
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute("SELECT * FROM kalshi_markets WHERE status='active'")
+    return [_kalshi_market_from_row(r) for r in cur.fetchall()]
+
+
+def _kalshi_market_from_row(row: sqlite3.Row) -> KalshiMarketRow:
+    return KalshiMarketRow(
+        ticker=row["ticker"],
+        event_ticker=row["event_ticker"],
+        title=row["title"],
+        category=row["category"],
+        status=row["status"],
+        end_date=row["end_date"],
+        yes_bid=_d(row["yes_bid"]),
+        volume=_d(row["volume"]),
+        taker_fee_coeff=Decimal(row["taker_fee_coeff"]),
+        synced_at=row["synced_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# kalshi_book_snapshots
+# ---------------------------------------------------------------------------
+
+def insert_kalshi_snapshot(conn: sqlite3.Connection, snap: KalshiSnapshotRow) -> None:
+    """Append one Kalshi orderbook snapshot."""
+    conn.execute(
+        """
+        INSERT INTO kalshi_book_snapshots
+            (ticker, ts, yes_bids, no_bids, best_yes_ask, best_no_ask, single_sided)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snap.ticker,
+            snap.ts,
+            _levels_to_json(snap.yes_bids),
+            _levels_to_json(snap.no_bids),
+            _s(snap.best_yes_ask),
+            _s(snap.best_no_ask),
+            int(snap.single_sided),
+        ),
+    )
+    conn.commit()
+
+
+def get_latest_kalshi_snapshots_in_window(
+    conn: sqlite3.Connection,
+    window_sec: int = 90,
+) -> list[KalshiSnapshotRow]:
+    """Most recent Kalshi snapshot per ticker within the last window_sec seconds."""
+    cutoff = (datetime.now(tz=timezone.utc) - timedelta(seconds=window_sec)).isoformat()
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        """
+        SELECT ks.*
+        FROM kalshi_book_snapshots ks
+        INNER JOIN (
+            SELECT ticker, MAX(ts) AS max_ts
+            FROM kalshi_book_snapshots
+            WHERE ts >= ?
+            GROUP BY ticker
+        ) latest ON ks.ticker = latest.ticker AND ks.ts = latest.max_ts
+        """,
+        (cutoff,),
+    )
+    return [_kalshi_snap_from_row(r) for r in cur.fetchall()]
+
+
+def _kalshi_snap_from_row(row: sqlite3.Row) -> KalshiSnapshotRow:
+    return KalshiSnapshotRow(
+        id=row["id"],
+        ticker=row["ticker"],
+        ts=row["ts"],
+        yes_bids=_json_to_levels(row["yes_bids"]),
+        no_bids=_json_to_levels(row["no_bids"]),
+        best_yes_ask=_d(row["best_yes_ask"]),
+        best_no_ask=_d(row["best_no_ask"]),
+        single_sided=bool(row["single_sided"]),
     )
 
 

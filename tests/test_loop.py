@@ -1,17 +1,20 @@
 """Tests for the cmd_loop() function in app/run.py.
 
-All tests mock time.sleep (via stop.wait), time.monotonic, cmd_discover, and
-cmd_snapshot so the loop runs synchronously without I/O or real delays.
+All tests mock time.sleep (via stop.wait), time.monotonic, cmd_discover,
+cmd_snapshot, cmd_kalshi_discover, and cmd_kalshi_snapshot so the loop runs
+synchronously without I/O or real delays.
 
 Design notes
 ------------
 * cmd_loop accepts a `_stop` threading.Event that overrides the module-level
   flag.  Tests inject their own event to control termination.
-* stop.wait(interval) is the only sleep in the loop.  With interval=0 and a
-  stop event set inside cmd_snapshot, the loop terminates after exactly the
-  number of cycles controlled by the test.
+* stop.wait(sleep_sec) is the only sleep in the loop.  With interval=0 the
+  wall-clock adjusted sleep_sec is always 0.0, so the loop terminates after
+  exactly the number of cycles controlled by the test.
 * time.monotonic is patched via side_effect lists so each call returns a
   predictable value, enabling precise elapsed-time simulation.
+* Kalshi functions are patched via the _mock_kalshi_cmds autouse fixture so
+  existing tests need no changes; new Kalshi tests override as needed.
 """
 from __future__ import annotations
 
@@ -21,6 +24,17 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from app.run import cmd_loop
+
+
+# ---------------------------------------------------------------------------
+# Autouse fixture: patch Kalshi commands for all tests in this module
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _mock_kalshi_cmds(monkeypatch):
+    """Silently no-op cmd_kalshi_discover and cmd_kalshi_snapshot in all tests."""
+    monkeypatch.setattr("app.run.cmd_kalshi_discover", lambda cfg: 0)
+    monkeypatch.setattr("app.run.cmd_kalshi_snapshot", lambda cfg, top=None, by="volume_desc": 0)
 
 
 # ---------------------------------------------------------------------------
@@ -39,24 +53,32 @@ def _run_loop(
     monotonic_values: list[float],
     snapshot_side_effect,
     discover_side_effect=None,
+    kalshi_discover_side_effect=None,
+    kalshi_snapshot_side_effect=None,
     interval: int = 0,
     top: int = 10,
     by: str = "volume_24h",
     discover_every: int = 900,
-) -> tuple[MagicMock, MagicMock]:
-    """Helper: patch discover/snapshot/monotonic, run cmd_loop, return mocks."""
+) -> tuple[MagicMock, MagicMock, MagicMock, MagicMock]:
+    """Helper: patch all loop commands + monotonic, run cmd_loop, return mocks.
+
+    Returns (mock_discover, mock_snapshot, mock_kalshi_discover, mock_kalshi_snapshot).
+    """
     stop = threading.Event()
     cfg = _cfg()
 
     with (
         patch("app.run.cmd_discover", side_effect=discover_side_effect) as mock_discover,
         patch("app.run.cmd_snapshot", side_effect=snapshot_side_effect) as mock_snapshot,
+        patch("app.run.cmd_kalshi_discover", side_effect=kalshi_discover_side_effect) as mock_k_discover,
+        patch("app.run.cmd_kalshi_snapshot", side_effect=kalshi_snapshot_side_effect,
+              return_value=0) as mock_k_snapshot,
         patch("time.monotonic", side_effect=monotonic_values),
     ):
         cmd_loop(cfg, interval=interval, top=top, by=by,
                  discover_every=discover_every, _stop=stop)
 
-    return mock_discover, mock_snapshot
+    return mock_discover, mock_snapshot, mock_k_discover, mock_k_snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -311,3 +333,106 @@ class TestLoopStopFlag:
             exited[0] = True
 
         assert exited[0], "cmd_loop must return after stop event is set"
+
+
+# ---------------------------------------------------------------------------
+# Kalshi integration in the loop
+# ---------------------------------------------------------------------------
+
+class TestLoopKalshiIntegration:
+    def test_kalshi_discover_called_on_start(self) -> None:
+        """cmd_kalshi_discover is called once during loop startup."""
+        stop = threading.Event()
+        cfg = _cfg()
+
+        def fake_snapshot(c, top=None, by="volume_24h"):
+            stop.set()
+            return 0
+
+        with (
+            patch("app.run.cmd_discover"),
+            patch("app.run.cmd_snapshot", side_effect=fake_snapshot),
+            patch("app.run.cmd_kalshi_discover") as mock_k_discover,
+            patch("app.run.cmd_kalshi_snapshot", return_value=0),
+            patch("time.monotonic", side_effect=[0.0, 0.0]),
+        ):
+            cmd_loop(cfg, interval=0, _stop=stop)
+
+        mock_k_discover.assert_called_once_with(cfg)
+
+    def test_kalshi_snapshot_called_each_cycle(self) -> None:
+        """cmd_kalshi_snapshot is called on every snapshot cycle."""
+        stop = threading.Event()
+        snapshot_count = [0]
+        cfg = _cfg()
+
+        def fake_snapshot(c, top=None, by="volume_24h"):
+            snapshot_count[0] += 1
+            if snapshot_count[0] >= 2:
+                stop.set()
+            return 3
+
+        with (
+            patch("app.run.cmd_discover"),
+            patch("app.run.cmd_snapshot", side_effect=fake_snapshot),
+            patch("app.run.cmd_kalshi_discover"),
+            patch("app.run.cmd_kalshi_snapshot", return_value=5) as mock_k_snap,
+            patch("time.monotonic", side_effect=[0.0, 0.0, 0.0]),
+        ):
+            cmd_loop(cfg, interval=0, _stop=stop)
+
+        assert mock_k_snap.call_count == 2
+
+    def test_kalshi_snapshot_error_does_not_crash_loop(self) -> None:
+        """Exception in cmd_kalshi_snapshot is caught; loop continues."""
+        stop = threading.Event()
+        snap_count = [0]
+        cfg = _cfg()
+
+        def fake_kalshi_snapshot(c, top=None, by="volume_desc"):
+            if snap_count[0] < 1:
+                raise RuntimeError("kalshi api down")
+            return 0
+
+        def fake_snapshot(c, top=None, by="volume_24h"):
+            snap_count[0] += 1
+            if snap_count[0] >= 2:
+                stop.set()
+            return 1
+
+        with (
+            patch("app.run.cmd_discover"),
+            patch("app.run.cmd_snapshot", side_effect=fake_snapshot),
+            patch("app.run.cmd_kalshi_discover"),
+            patch("app.run.cmd_kalshi_snapshot", side_effect=fake_kalshi_snapshot),
+            patch("time.monotonic", side_effect=[0.0, 0.0, 0.0]),
+        ):
+            cmd_loop(cfg, interval=0, _stop=stop)
+
+        assert snap_count[0] == 2
+
+    def test_kalshi_discover_called_on_rediscover(self) -> None:
+        """cmd_kalshi_discover is called again when rediscover interval elapses."""
+        stop = threading.Event()
+        snap_count = [0]
+        cfg = _cfg()
+
+        def fake_snapshot(c, top=None, by="volume_24h"):
+            snap_count[0] += 1
+            if snap_count[0] >= 2:
+                stop.set()
+            return 0
+
+        with (
+            patch("app.run.cmd_discover"),
+            patch("app.run.cmd_snapshot", side_effect=fake_snapshot),
+            patch("app.run.cmd_kalshi_discover") as mock_k_discover,
+            patch("app.run.cmd_kalshi_snapshot", return_value=0),
+            # [0] init, [1] cycle1 elapsed→901≥900 rediscover, [2] last_discover_at update,
+            # [3] cycle2 elapsed
+            patch("time.monotonic", side_effect=[0.0, 901.0, 901.0, 905.0]),
+        ):
+            cmd_loop(cfg, interval=0, discover_every=900, _stop=stop)
+
+        # initial + one rediscover = 2 calls
+        assert mock_k_discover.call_count == 2

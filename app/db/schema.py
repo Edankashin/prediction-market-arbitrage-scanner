@@ -197,6 +197,50 @@ CREATE INDEX IF NOT EXISTS idx_scan_log_ts_net
     ON scan_log(ts, net_edge_bps DESC)
 """
 
+_KALSHI_MARKETS = """
+CREATE TABLE IF NOT EXISTS kalshi_markets (
+    ticker           TEXT PRIMARY KEY,
+    event_ticker     TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    category         TEXT,
+    status           TEXT NOT NULL DEFAULT 'active',
+    end_date         TEXT,
+    yes_bid          TEXT,
+    volume           TEXT,
+    taker_fee_coeff  TEXT NOT NULL DEFAULT '0.07',
+    synced_at        TEXT NOT NULL
+)
+"""
+
+_IDX_KALSHI_MARKETS_EVENT = """
+CREATE INDEX IF NOT EXISTS idx_kalshi_markets_event
+    ON kalshi_markets(event_ticker)
+"""
+
+_IDX_KALSHI_MARKETS_STATUS = """
+CREATE INDEX IF NOT EXISTS idx_kalshi_markets_status
+    ON kalshi_markets(status)
+"""
+
+_KALSHI_BOOK_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS kalshi_book_snapshots (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker       TEXT NOT NULL,
+    ts           TEXT NOT NULL,
+    yes_bids     TEXT NOT NULL,
+    no_bids      TEXT NOT NULL,
+    best_yes_ask TEXT,
+    best_no_ask  TEXT,
+    single_sided INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (ticker) REFERENCES kalshi_markets(ticker)
+)
+"""
+
+_IDX_KALSHI_SNAP_TICKER_TS = """
+CREATE INDEX IF NOT EXISTS idx_kalshi_snapshots_ticker_ts
+    ON kalshi_book_snapshots(ticker, ts)
+"""
+
 _SCHEMA_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER NOT NULL,
@@ -223,21 +267,28 @@ _ALL_DDL = [
     _DATA_API_POSITIONS,
     _SCAN_LOG,
     _IDX_SCAN_LOG_TS_NET,
+    _KALSHI_MARKETS,
+    _IDX_KALSHI_MARKETS_EVENT,
+    _IDX_KALSHI_MARKETS_STATUS,
+    _KALSHI_BOOK_SNAPSHOTS,
+    _IDX_KALSHI_SNAP_TICKER_TS,
     _SCHEMA_VERSION,
 ]
 
-CURRENT_VERSION = 2
+CURRENT_VERSION = 3
 
 
 def migrate(conn: sqlite3.Connection) -> None:
     """Apply all DDL statements and set schema_version = CURRENT_VERSION.
 
     Idempotent: safe to call on an already-migrated database.
+    DELETE + INSERT keeps version current across upgrades.
     """
     for ddl in _ALL_DDL:
         conn.execute(ddl)
+    conn.execute("DELETE FROM schema_version")
     conn.execute(
-        "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)",
+        "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
         (CURRENT_VERSION, _now()),
     )
     conn.commit()
