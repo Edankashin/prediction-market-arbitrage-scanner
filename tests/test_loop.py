@@ -32,9 +32,11 @@ from app.run import cmd_loop
 
 @pytest.fixture(autouse=True)
 def _mock_kalshi_cmds(monkeypatch):
-    """Silently no-op cmd_kalshi_discover and cmd_kalshi_snapshot in all tests."""
+    """Silently no-op Kalshi and cross-platform commands in all tests."""
     monkeypatch.setattr("app.run.cmd_kalshi_discover", lambda cfg: 0)
     monkeypatch.setattr("app.run.cmd_kalshi_snapshot", lambda cfg, top=None, by="volume_desc": 0)
+    monkeypatch.setattr("app.run.cmd_cross_snapshot", lambda cfg: (0, 0))
+    monkeypatch.setattr("app.run.cmd_cross_scan", lambda cfg: 0)
 
 
 # ---------------------------------------------------------------------------
@@ -436,3 +438,93 @@ class TestLoopKalshiIntegration:
 
         # initial + one rediscover = 2 calls
         assert mock_k_discover.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform integration in the loop
+# ---------------------------------------------------------------------------
+
+class TestLoopCrossIntegration:
+    def test_cross_snapshot_called_each_cycle(self) -> None:
+        """cmd_cross_snapshot is called on every snapshot cycle."""
+        stop = threading.Event()
+        snapshot_count = [0]
+        cfg = _cfg()
+
+        def fake_snapshot(c, top=None, by="volume_24h"):
+            snapshot_count[0] += 1
+            if snapshot_count[0] >= 3:
+                stop.set()
+            return 2
+
+        with (
+            patch("app.run.cmd_discover"),
+            patch("app.run.cmd_snapshot", side_effect=fake_snapshot),
+            patch("app.run.cmd_kalshi_discover"),
+            patch("app.run.cmd_kalshi_snapshot", return_value=0),
+            patch("app.run.cmd_cross_snapshot", return_value=(2, 1)) as mock_x_snap,
+            patch("app.run.cmd_cross_scan", return_value=0),
+            patch("time.monotonic", side_effect=[0.0, 0.0, 0.0, 0.0]),
+        ):
+            cmd_loop(cfg, interval=0, _stop=stop)
+
+        assert mock_x_snap.call_count == 3
+
+    def test_cross_scan_called_on_cycle_multiple_of_scan_every(self) -> None:
+        """cmd_cross_scan is called every _SCAN_EVERY (5) cycles, not every cycle."""
+        stop = threading.Event()
+        snapshot_count = [0]
+        cfg = _cfg()
+
+        def fake_snapshot(c, top=None, by="volume_24h"):
+            snapshot_count[0] += 1
+            if snapshot_count[0] >= 5:
+                stop.set()
+            return 1
+
+        with (
+            patch("app.run.cmd_discover"),
+            patch("app.run.cmd_snapshot", side_effect=fake_snapshot),
+            patch("app.run.cmd_kalshi_discover"),
+            patch("app.run.cmd_kalshi_snapshot", return_value=0),
+            patch("app.run.cmd_cross_snapshot", return_value=(0, 0)),
+            patch("app.run.cmd_cross_scan", return_value=0) as mock_x_scan,
+            patch("time.monotonic", side_effect=[0.0] + [0.0] * 10),
+        ):
+            cmd_loop(cfg, interval=0, _stop=stop)
+
+        # Only cycle 5 is a multiple of _SCAN_EVERY=5, so called exactly once
+        assert mock_x_scan.call_count == 1
+
+    def test_cross_snapshot_error_does_not_crash_loop(self) -> None:
+        """Exception in cmd_cross_snapshot is caught; loop continues."""
+        stop = threading.Event()
+        snap_count = [0]
+        cfg = _cfg()
+
+        cs_call_count = [0]
+
+        def fake_cross_snapshot(c):
+            cs_call_count[0] += 1
+            if cs_call_count[0] == 1:
+                raise RuntimeError("clob api down")
+            return (0, 0)
+
+        def fake_snapshot(c, top=None, by="volume_24h"):
+            snap_count[0] += 1
+            if snap_count[0] >= 2:
+                stop.set()
+            return 1
+
+        with (
+            patch("app.run.cmd_discover"),
+            patch("app.run.cmd_snapshot", side_effect=fake_snapshot),
+            patch("app.run.cmd_kalshi_discover"),
+            patch("app.run.cmd_kalshi_snapshot", return_value=0),
+            patch("app.run.cmd_cross_snapshot", side_effect=fake_cross_snapshot),
+            patch("app.run.cmd_cross_scan", return_value=0),
+            patch("time.monotonic", side_effect=[0.0, 0.0, 0.0]),
+        ):
+            cmd_loop(cfg, interval=0, _stop=stop)
+
+        assert snap_count[0] == 2

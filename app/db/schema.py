@@ -267,6 +267,44 @@ CREATE INDEX IF NOT EXISTS idx_pairs_status_pm
     ON cross_platform_pairs(status, pm_condition_id)
 """
 
+_CROSS_PLATFORM_SCAN_LOG = """
+CREATE TABLE IF NOT EXISTS cross_platform_scan_log (
+    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id                      INTEGER NOT NULL
+                                 REFERENCES cross_platform_pairs(id),
+    scanned_at                   TEXT NOT NULL,
+    direction                    TEXT NOT NULL
+                                 CHECK(direction IN ('A','B','BOTH')),
+    pm_yes_ask                   TEXT,
+    pm_no_ask                    TEXT,
+    kalshi_yes_ask               TEXT,
+    kalshi_no_ask                TEXT,
+    gross_profit_per_unit        TEXT,
+    pm_fee_total                 TEXT,
+    kalshi_fee_total             TEXT,
+    gas_flat                     TEXT,
+    net_profit_at_size           TEXT,
+    net_profit_per_unit_excl_gas TEXT,
+    net_edge_bps                 INTEGER,
+    max_profitable_units         TEXT,
+    pm_snapshot_age_sec          INTEGER,
+    kalshi_snapshot_age_sec      INTEGER,
+    skipped                      INTEGER NOT NULL DEFAULT 0,
+    skip_reason                  TEXT
+)
+"""
+
+_IDX_CROSS_SCAN_PAIR_SCANNED = """
+CREATE INDEX IF NOT EXISTS idx_cross_scan_pair_scanned
+    ON cross_platform_scan_log(pair_id, scanned_at)
+"""
+
+_IDX_CROSS_SCAN_NET_EDGE = """
+CREATE INDEX IF NOT EXISTS idx_cross_scan_net_edge
+    ON cross_platform_scan_log(scanned_at, net_edge_bps DESC)
+    WHERE skipped = 0
+"""
+
 _SCHEMA_VERSION = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER NOT NULL,
@@ -300,23 +338,25 @@ _ALL_DDL = [
     _IDX_KALSHI_SNAP_TICKER_TS,
     _CROSS_PLATFORM_PAIRS,
     _IDX_PAIRS_STATUS,
+    _CROSS_PLATFORM_SCAN_LOG,
+    _IDX_CROSS_SCAN_PAIR_SCANNED,
+    _IDX_CROSS_SCAN_NET_EDGE,
     _SCHEMA_VERSION,
 ]
 
-CURRENT_VERSION = 4
+CURRENT_VERSION = 5
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Apply all DDL statements and set schema_version = CURRENT_VERSION.
+    """Apply all DDL statements and record schema_version = CURRENT_VERSION.
 
     Idempotent: safe to call on an already-migrated database.
-    DELETE + INSERT keeps version current across upgrades.
+    INSERT OR IGNORE leaves pre-existing version rows untouched.
     """
     for ddl in _ALL_DDL:
         conn.execute(ddl)
-    conn.execute("DELETE FROM schema_version")
     conn.execute(
-        "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)",
         (CURRENT_VERSION, _now()),
     )
     conn.commit()

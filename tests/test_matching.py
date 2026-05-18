@@ -460,12 +460,12 @@ class TestSchemaV4:
         }
         assert "cross_platform_pairs" in tables
 
-    def test_schema_version_is_4(self) -> None:
+    def test_schema_version_is_5(self) -> None:
         from app.db.schema import CURRENT_VERSION
         conn = _mem_db()
         ver = conn.execute("SELECT version FROM schema_version").fetchone()[0]
-        assert ver == 4
-        assert CURRENT_VERSION == 4
+        assert ver == 5
+        assert CURRENT_VERSION == 5
 
     def test_index_on_pairs_status(self) -> None:
         conn = _mem_db()

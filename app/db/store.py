@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from app.models import (
     BookLevel,
+    CrossScanRow,
     DataApiPositionRow,
     FeeRateRow,
     KalshiMarketRow,
@@ -818,6 +819,128 @@ def _kalshi_snap_from_row(row: sqlite3.Row) -> KalshiSnapshotRow:
         best_yes_ask=_d(row["best_yes_ask"]),
         best_no_ask=_d(row["best_no_ask"]),
         single_sided=bool(row["single_sided"]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# cross_platform_pairs — full join for scanner
+# ---------------------------------------------------------------------------
+
+def get_confirmed_pairs_full(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Join confirmed pairs with markets and kalshi_markets for the scanner.
+
+    Returns one sqlite3.Row per pair with fields: pair_id, pm_condition_id,
+    kalshi_ticker, clob_token_ids, outcomes, taker_fee_coeff.
+    Uses LEFT JOIN so pairs whose market was deactivated still appear
+    (scanner will skip them via pm_outcomes_unresolvable).
+    """
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        """
+        SELECT
+            p.id              AS pair_id,
+            p.pm_condition_id AS pm_condition_id,
+            p.kalshi_ticker   AS kalshi_ticker,
+            m.clob_token_ids  AS clob_token_ids,
+            m.outcomes        AS outcomes,
+            COALESCE(km.taker_fee_coeff, '0.07') AS taker_fee_coeff
+        FROM cross_platform_pairs p
+        LEFT JOIN markets m       ON m.condition_id = p.pm_condition_id
+        LEFT JOIN kalshi_markets km ON km.ticker   = p.kalshi_ticker
+        WHERE p.status = 'confirmed'
+        """
+    )
+    return cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# cross_platform_scan_log
+# ---------------------------------------------------------------------------
+
+def insert_cross_scan_row(conn: sqlite3.Connection, row: CrossScanRow) -> None:
+    """Append one cross-platform scan result to the log."""
+    conn.execute(
+        """
+        INSERT INTO cross_platform_scan_log (
+            pair_id, scanned_at, direction,
+            pm_yes_ask, pm_no_ask, kalshi_yes_ask, kalshi_no_ask,
+            gross_profit_per_unit, pm_fee_total, kalshi_fee_total,
+            gas_flat, net_profit_at_size, net_profit_per_unit_excl_gas,
+            net_edge_bps, max_profitable_units,
+            pm_snapshot_age_sec, kalshi_snapshot_age_sec,
+            skipped, skip_reason
+        ) VALUES (
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?,
+            ?, ?,
+            ?, ?,
+            ?, ?
+        )
+        """,
+        (
+            row.pair_id,
+            row.scanned_at,
+            row.direction,
+            _s(row.pm_yes_ask),
+            _s(row.pm_no_ask),
+            _s(row.kalshi_yes_ask),
+            _s(row.kalshi_no_ask),
+            _s(row.gross_profit_per_unit),
+            _s(row.pm_fee_total),
+            _s(row.kalshi_fee_total),
+            _s(row.gas_flat),
+            _s(row.net_profit_at_size),
+            _s(row.net_profit_per_unit_excl_gas),
+            row.net_edge_bps,
+            _s(row.max_profitable_units),
+            row.pm_snapshot_age_sec,
+            row.kalshi_snapshot_age_sec,
+            int(row.skipped),
+            row.skip_reason,
+        ),
+    )
+    conn.commit()
+
+
+def get_cross_scan_log_last_24h(conn: sqlite3.Connection) -> list[CrossScanRow]:
+    """All cross_platform_scan_log rows from the last 24 h, newest first."""
+    cutoff = (datetime.now(tz=timezone.utc) - timedelta(hours=24)).isoformat()
+    conn.row_factory = sqlite3.Row
+    cur = conn.execute(
+        """
+        SELECT * FROM cross_platform_scan_log
+        WHERE scanned_at >= ?
+        ORDER BY scanned_at DESC
+        """,
+        (cutoff,),
+    )
+    return [_cross_scan_from_row(r) for r in cur.fetchall()]
+
+
+def _cross_scan_from_row(row: sqlite3.Row) -> CrossScanRow:
+    return CrossScanRow(
+        id=row["id"],
+        pair_id=row["pair_id"],
+        scanned_at=row["scanned_at"],
+        direction=row["direction"],
+        pm_yes_ask=_d(row["pm_yes_ask"]),
+        pm_no_ask=_d(row["pm_no_ask"]),
+        kalshi_yes_ask=_d(row["kalshi_yes_ask"]),
+        kalshi_no_ask=_d(row["kalshi_no_ask"]),
+        gross_profit_per_unit=_d(row["gross_profit_per_unit"]),
+        pm_fee_total=_d(row["pm_fee_total"]),
+        kalshi_fee_total=_d(row["kalshi_fee_total"]),
+        gas_flat=_d(row["gas_flat"]),
+        net_profit_at_size=_d(row["net_profit_at_size"]),
+        net_profit_per_unit_excl_gas=_d(row["net_profit_per_unit_excl_gas"]),
+        net_edge_bps=row["net_edge_bps"],
+        max_profitable_units=_d(row["max_profitable_units"]),
+        pm_snapshot_age_sec=row["pm_snapshot_age_sec"],
+        kalshi_snapshot_age_sec=row["kalshi_snapshot_age_sec"],
+        skipped=bool(row["skipped"]),
+        skip_reason=row["skip_reason"],
     )
 
 

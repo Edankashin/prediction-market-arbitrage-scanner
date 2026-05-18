@@ -14,6 +14,9 @@ Usage (from repo root):
     python -m app.run match-confirm --pm-condition-id <id> --kalshi-ticker <ticker> --note "<text>"
     python -m app.run match-reject --pair-id <id> --reason "<text>"
     python -m app.run match-list [--status confirmed|rejected|all]
+    python -m app.run cross-snapshot
+    python -m app.run cross-scan
+    python -m app.run cross-scan-log
     python -m app.run backtest --start 2026-05-01T00:00:00 --end 2026-05-14T00:00:00
     python -m app.run loop [--interval 60] [--top 50] [--by volume_24h] [--discover-every 900]
 """
@@ -393,6 +396,173 @@ def cmd_kalshi_snapshot(
     return stored
 
 
+def cmd_cross_snapshot(cfg: object) -> tuple[int, int]:  # type: ignore[type-arg]
+    """Fetch PM + Kalshi orderbooks for all confirmed pairs.
+
+    PM tokens are fetched in one bulk POST /books call.
+    Kalshi tickers are fetched serially (no bulk endpoint exists).
+    Returns (pm_stored, kalshi_stored).  Returns (0, 0) if cfg.kalshi absent.
+    """
+    if not hasattr(cfg, "kalshi"):
+        return (0, 0)
+
+    import dataclasses
+
+    from app.api.clob import ClobPublicClient
+    from app.api.kalshi import KalshiClient
+    from app.db import schema, store
+    from app.fees import fee_bps_from_formula
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+
+    pairs = store.get_confirmed_pairs_full(conn)
+    if not pairs:
+        return (0, 0)
+
+    # Collect all unique PM token_ids from confirmed pairs
+    token_to_condition: dict[str, str] = {}
+    for p in pairs:
+        try:
+            tokens: list[str] = json.loads(p["clob_token_ids"] or "[]")
+        except Exception:
+            continue
+        for tok in tokens:
+            token_to_condition[tok] = p["pm_condition_id"]
+
+    # Build market lookup for fee stamping
+    all_markets = {m.condition_id: m for m in store.get_active_markets(conn)}
+
+    # Bulk PM fetch — one POST /books call for all tokens
+    clob = ClobPublicClient(cfg.clob)  # type: ignore[attr-defined]
+    all_token_ids = list(token_to_condition.keys())
+    snaps = clob.get_order_books(all_token_ids)
+
+    pm_stored = 0
+    for snap in snaps:
+        if not snap.condition_id and snap.token_id in token_to_condition:
+            snap = dataclasses.replace(snap, condition_id=token_to_condition[snap.token_id])
+        if not snap.condition_id:
+            continue
+        market = all_markets.get(snap.condition_id)
+        if market is not None and snap.mid is not None:
+            fee_bps = fee_bps_from_formula(market, snap.mid)
+            snap = dataclasses.replace(snap, taker_fee_bps=fee_bps)
+        store.insert_snapshot(conn, snap)
+        pm_stored += 1
+
+    # Serial Kalshi fetch — one request per unique ticker
+    kalshi = KalshiClient(cfg.kalshi)  # type: ignore[attr-defined]
+    seen_tickers: set[str] = set()
+    kal_stored = 0
+    for p in pairs:
+        ticker: str = p["kalshi_ticker"]
+        if ticker in seen_tickers:
+            continue
+        seen_tickers.add(ticker)
+        try:
+            raw = kalshi.get_orderbook(ticker)
+            snap_k = kalshi.parse_and_validate_snapshot(ticker, raw)
+            if snap_k is not None:
+                store.insert_kalshi_snapshot(conn, snap_k)
+                kal_stored += 1
+        except Exception as exc:
+            _log.warning(
+                "cross_snapshot_kalshi_error",
+                extra={"ticker": ticker, "error": str(exc)},
+            )
+
+    _log.info(
+        "cross_snapshot_complete",
+        extra={"pm_stored": pm_stored, "kal_stored": kal_stored},
+    )
+    return (pm_stored, kal_stored)
+
+
+def cmd_cross_scan(cfg: object) -> int:  # type: ignore[type-arg]
+    """Scan all confirmed pairs for cross-platform arb; write results to scan log.
+
+    Returns count of non-skipped rows with positive net_edge_bps.
+    """
+    from decimal import Decimal
+
+    from app.db import schema, store
+    from app.strategies.cross_platform_scanner import scan_all_pairs
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    schema.migrate(conn)
+
+    gas = Decimal(str(cfg.gas.usdc_per_order))  # type: ignore[attr-defined]
+    rows = scan_all_pairs(conn, gas_usdc_per_order=gas)
+
+    opps = 0
+    for row in rows:
+        store.insert_cross_scan_row(conn, row)
+        if not row.skipped and row.net_edge_bps is not None and row.net_edge_bps > 0:
+            opps += 1
+
+    skip_count = sum(1 for r in rows if r.skipped)
+    _log.info(
+        "cross_scan_complete",
+        extra={"pairs_scanned": len(rows), "opps_found": opps, "skipped": skip_count},
+    )
+    return opps
+
+
+def cmd_cross_scan_log(cfg: object) -> None:  # type: ignore[type-arg]
+    """Print last 24 h of cross_platform_scan_log entries."""
+    from app.db import store
+
+    conn = _open_db(cfg.db.path)  # type: ignore[attr-defined]
+    rows = store.get_cross_scan_log_last_24h(conn)
+
+    if not rows:
+        print("No cross-platform scan results in the last 24 hours.")
+        return
+
+    non_skipped = [r for r in rows if not r.skipped]
+    opps = [r for r in non_skipped if r.net_edge_bps is not None and r.net_edge_bps > 0]
+
+    header = (
+        f"{'scanned_at':<26}  {'pair':>5}  {'dir':>4}  "
+        f"{'gross':>7}  {'net@sz':>8}  {'edge_bps':>8}  "
+        f"{'max_units':>10}  skip_reason"
+    )
+    print(header)
+    print("-" * len(header))
+
+    for r in rows[:50]:  # cap display at 50 rows
+        ts = r.scanned_at[:19]
+        if r.skipped:
+            print(
+                f"{ts:<26}  {r.pair_id:>5}  {r.direction:>4}  "
+                f"{'':>7}  {'':>8}  {'':>8}  {'':>10}  [{r.skip_reason}]"
+            )
+        else:
+            gross = f"{r.gross_profit_per_unit:.4f}" if r.gross_profit_per_unit is not None else ""
+            net = f"{r.net_profit_at_size:.4f}" if r.net_profit_at_size is not None else ""
+            ebps = str(r.net_edge_bps) if r.net_edge_bps is not None else ""
+            mu = f"{r.max_profitable_units:.1f}" if r.max_profitable_units is not None else ""
+            print(
+                f"{ts:<26}  {r.pair_id:>5}  {r.direction:>4}  "
+                f"{gross:>7}  {net:>8}  {ebps:>8}  {mu:>10}"
+            )
+
+    print()
+    skip_counts: dict[str, int] = {}
+    for r in rows:
+        if r.skipped and r.skip_reason:
+            skip_counts[r.skip_reason] = skip_counts.get(r.skip_reason, 0) + 1
+
+    print(
+        f"Total last 24h: {len(rows)}  |  scannable: {len(non_skipped)}  "
+        f"|  opps (net_edge>0): {len(opps)}"
+    )
+    if skip_counts:
+        dist = "  ".join(f"{k}: {v}" for k, v in sorted(skip_counts.items()))
+        print(f"Skip breakdown: {dist}")
+
+
 def cmd_match_search(cfg: object, query: str, top: int = 20) -> None:  # type: ignore[type-arg]
     """Search PM markets by keyword and rank by Jaccard token overlap."""
     from app.db import schema
@@ -683,6 +853,14 @@ def cmd_loop(
     snapshot cycle are caught, logged at ERROR, and the loop continues.
     Only KeyboardInterrupt causes a clean exit.
 
+    Cycle timing (target ~50 s with 60 s budget):
+      cmd_snapshot (PM top-50):              ~2 s
+      cmd_kalshi_snapshot (top-25):          ~13 s
+      cmd_cross_snapshot (66 pairs):         ~35 s  (1 PM bulk + 66 Kalshi serial)
+    Expect occasional loop_cycle_overran warnings of ~5–15 s magnitude during
+    network jitter or Kalshi rediscover cycles; these are non-fatal and handled
+    by the wall-clock adjusted sleep (sleep_sec = max(0, interval − elapsed)).
+
     Args:
         cfg: Loaded configuration object.
         interval: Seconds to sleep between snapshot rounds.
@@ -764,8 +942,11 @@ def cmd_loop(
                 # Snapshot round always runs, even if discover above failed
                 stored = cmd_snapshot(cfg, top=top, by=by)
 
-                # Kalshi snapshot round (top resolved inside cmd_kalshi_snapshot)
+                # Kalshi snapshot (top-25 by volume, for discovery of new pairs)
                 k_stored = cmd_kalshi_snapshot(cfg)
+
+                # Cross-platform snapshot: targeted fetch for all confirmed pairs
+                pm_cs, kal_cs = cmd_cross_snapshot(cfg)
 
                 cycle_count += 1
 
@@ -783,16 +964,20 @@ def cmd_loop(
                     extra={
                         "snapshots_stored": stored,
                         "kalshi_snapshots_stored": k_stored,
+                        "cross_pm_stored": pm_cs,
+                        "cross_kal_stored": kal_cs,
                         "sleep_sec": sleep_sec,
                     },
                 )
 
-                # Arb scan every _SCAN_EVERY cycles; isolated so it cannot
+                # Arb scans every _SCAN_EVERY cycles; isolated so they cannot
                 # interrupt the sleep or cause the loop to exit.
                 if cycle_count % _SCAN_EVERY == 0:
                     try:
                         found = cmd_scan(cfg)
                         _log.info("loop_scan_complete", extra={"opps_found": found})
+                        x_found = cmd_cross_scan(cfg)
+                        _log.info("loop_cross_scan_complete", extra={"opps_found": x_found})
                     except Exception as scan_exc:
                         _log.error(
                             "loop_scan_error",
@@ -854,6 +1039,10 @@ def main() -> None:
         "--by", choices=_BY_KALSHI_CHOICES, default="volume_desc",
         help="Sort key for market selection (default: volume_desc)",
     )
+
+    sub.add_parser("cross-snapshot", help="Fetch orderbooks for all confirmed pairs")
+    sub.add_parser("cross-scan", help="Scan confirmed pairs for cross-platform arb")
+    sub.add_parser("cross-scan-log", help="Print last 24 h of cross-platform scan results")
 
     ms_parser = sub.add_parser("match-search", help="Search PM markets by keyword")
     ms_parser.add_argument("query", help="Free-text search query")
@@ -923,6 +1112,12 @@ def main() -> None:
         cmd_kalshi_discover(cfg)
     elif args.command == "kalshi-snapshot":
         cmd_kalshi_snapshot(cfg, top=args.top, by=args.by)
+    elif args.command == "cross-snapshot":
+        cmd_cross_snapshot(cfg)
+    elif args.command == "cross-scan":
+        cmd_cross_scan(cfg)
+    elif args.command == "cross-scan-log":
+        cmd_cross_scan_log(cfg)
     elif args.command == "match-search":
         cmd_match_search(cfg, args.query, top=args.top)
     elif args.command == "match-candidates":

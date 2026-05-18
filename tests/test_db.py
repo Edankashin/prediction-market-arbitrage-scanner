@@ -89,6 +89,7 @@ def test_migrate_creates_tables(mem_db: sqlite3.Connection) -> None:
         "trades", "positions", "portfolio_snapshots",
         "data_api_positions", "scan_log", "schema_version",
         "kalshi_markets", "kalshi_book_snapshots",
+        "cross_platform_pairs", "cross_platform_scan_log",
     }
     assert expected.issubset(tables)
 
@@ -105,7 +106,7 @@ def test_migrate_idempotent(mem_db: sqlite3.Connection) -> None:
 
 def test_schema_version_set(mem_db: sqlite3.Connection) -> None:
     cur = mem_db.execute("SELECT version FROM schema_version")
-    assert cur.fetchone()[0] == 4
+    assert cur.fetchone()[0] == 5
 
 
 # ---------------------------------------------------------------------------

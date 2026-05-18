@@ -196,6 +196,32 @@ class KalshiSnapshotRow:
 
 
 @dataclass(frozen=True)
+class CrossScanRow:
+    """One scan-log entry for a confirmed PM ↔ Kalshi pair."""
+
+    pair_id: int
+    scanned_at: str           # ISO-8601 UTC
+    direction: str            # 'A' (pm_yes+kal_no) | 'B' (pm_no+kal_yes) | 'BOTH' (crossed)
+    pm_yes_ask: Decimal | None
+    pm_no_ask: Decimal | None
+    kalshi_yes_ask: Decimal | None
+    kalshi_no_ask: Decimal | None
+    gross_profit_per_unit: Decimal | None
+    pm_fee_total: Decimal | None
+    kalshi_fee_total: Decimal | None
+    gas_flat: Decimal | None
+    net_profit_at_size: Decimal | None
+    net_profit_per_unit_excl_gas: Decimal | None
+    net_edge_bps: int | None
+    max_profitable_units: Decimal | None
+    pm_snapshot_age_sec: int | None
+    kalshi_snapshot_age_sec: int | None
+    skipped: bool
+    skip_reason: str | None
+    id: int | None = None
+
+
+@dataclass(frozen=True)
 class CrossPlatformPairRow:
     """One confirmed (or rejected) PM ↔ Kalshi market pair."""
 
