@@ -317,24 +317,13 @@ def cmd_kalshi_discover(cfg: object) -> int:  # type: ignore[type-arg]
     schema.migrate(conn)
 
     synced_at = datetime.now(tz=timezone.utc).isoformat()
-    events = kalshi.get_all_open_events()
+    markets_with_cats = kalshi.discover_all_markets()  # may raise KalshiDiscoverAbortedError
 
     count = 0
-    for event in events:
-        event_ticker = event.get("event_ticker", "")
-        category = event.get("category")
-        try:
-            markets = kalshi.get_markets_for_event(event_ticker)
-        except Exception as exc:
-            _log.warning(
-                "kalshi_discover_event_error",
-                extra={"event_ticker": event_ticker, "error": str(exc)},
-            )
-            continue
-        for mkt_raw in markets:
-            row = kalshi.parse_market_row(mkt_raw, category, synced_at)
-            store.upsert_kalshi_market(conn, row)
-            count += 1
+    for mkt_raw, category in markets_with_cats:
+        row = kalshi.parse_market_row(mkt_raw, category, synced_at)
+        store.upsert_kalshi_market(conn, row)
+        count += 1
 
     _log.info("kalshi_discover_complete", extra={"markets_stored": count})
     return count
@@ -871,6 +860,8 @@ def cmd_loop(
                (which is set by the SIGTERM handler).  Pass a custom event
                in tests to control loop termination.
     """
+    from app.api.kalshi import KalshiDiscoverAbortedError
+
     stop = _stop if _stop is not None else _loop_stop
     _install_sigterm_handler(stop)
 
@@ -898,6 +889,11 @@ def cmd_loop(
         )
     try:
         cmd_kalshi_discover(cfg)
+    except KalshiDiscoverAbortedError as abort_exc:
+        _log.warning(
+            "kalshi_discover_aborted_circuit_breaker",
+            extra={"consecutive_failures": abort_exc.consecutive_failures},
+        )
     except Exception as init_exc:
         _log.error(
             "loop_initial_kalshi_discover_error",
@@ -932,6 +928,11 @@ def cmd_loop(
                         # next cycle will retry discover
                     try:
                         cmd_kalshi_discover(cfg)
+                    except KalshiDiscoverAbortedError as abort_exc:
+                        _log.warning(
+                            "kalshi_discover_aborted_circuit_breaker",
+                            extra={"consecutive_failures": abort_exc.consecutive_failures},
+                        )
                     except Exception as k_exc:
                         _log.error(
                             "loop_kalshi_discover_error",

@@ -9,8 +9,9 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests.exceptions
 
-from app.api.kalshi import KalshiClient
+from app.api.kalshi import KalshiClient, KalshiDiscoverAbortedError
 from app.core.config import KalshiConfig
 from app.models import KalshiMarketRow
 
@@ -174,3 +175,96 @@ class TestGetMarketsForEvent:
         with patch("requests.Session.get", return_value=resp):
             result = _client().get_markets_for_event("EVT-EMPTY")
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# discover_all_markets — circuit breaker
+# ---------------------------------------------------------------------------
+
+def _make_events(n: int) -> list[dict]:
+    return [{"event_ticker": f"EVT-{i}", "category": "Sports"} for i in range(n)]
+
+
+def _conn_error() -> requests.exceptions.ConnectionError:
+    return requests.exceptions.ConnectionError("DNS failure")
+
+
+def _timeout_error() -> requests.exceptions.Timeout:
+    return requests.exceptions.Timeout("timed out")
+
+
+def _http_5xx() -> requests.exceptions.HTTPError:
+    resp = MagicMock()
+    resp.status_code = 503
+    return requests.exceptions.HTTPError(response=resp)
+
+
+class TestDiscoverAllMarkets:
+    def _setup(self, client: KalshiClient, events: list[dict], market_side_effects: list):
+        """Patch get_all_open_events and get_markets_for_event on the client."""
+        client.get_all_open_events = MagicMock(return_value=events)  # type: ignore[method-assign]
+        client.get_markets_for_event = MagicMock(side_effect=market_side_effects)  # type: ignore[method-assign]
+
+    def test_four_consecutive_failures_then_success_no_abort(self) -> None:
+        """4 consecutive circuit-breaker errors followed by 1 success → no abort,
+        results contain markets from the successful event only."""
+        client = _client()
+        events = _make_events(5)
+        markets_for_evt4 = [_fake_market_raw(f"MKT-{i}") for i in range(2)]
+        self._setup(client, events, [
+            _conn_error(),
+            _conn_error(),
+            _conn_error(),
+            _conn_error(),
+            markets_for_evt4,  # 5th succeeds
+        ])
+
+        result = client.discover_all_markets(consecutive_fail_limit=5)
+
+        assert len(result) == 2
+        assert result[0][1] == "Sports"  # category preserved
+        assert client.get_markets_for_event.call_count == 5
+
+    def test_five_consecutive_failures_raises_abort(self) -> None:
+        """5 consecutive circuit-breaker errors → KalshiDiscoverAbortedError."""
+        client = _client()
+        events = _make_events(10)
+        self._setup(client, events, [_conn_error()] * 10)
+
+        with pytest.raises(KalshiDiscoverAbortedError) as exc_info:
+            client.discover_all_markets(consecutive_fail_limit=5)
+
+        assert exc_info.value.consecutive_failures == 5
+        assert client.get_markets_for_event.call_count == 5
+
+    def test_mixed_error_types_count_toward_same_threshold(self) -> None:
+        """ConnectionError, Timeout, and HTTPError(5xx) all increment the same counter."""
+        client = _client()
+        events = _make_events(10)
+        self._setup(client, events, [
+            _conn_error(),
+            _timeout_error(),
+            _http_5xx(),
+            _conn_error(),
+            _conn_error(),
+        ])
+
+        with pytest.raises(KalshiDiscoverAbortedError) as exc_info:
+            client.discover_all_markets(consecutive_fail_limit=5)
+
+        assert exc_info.value.consecutive_failures == 5
+
+    def test_success_then_failure_tail_aborts_mid_pagination(self) -> None:
+        """3 successful events then 5 consecutive failures → abort mid-run,
+        partial results from the successful events are discarded (exception raised)."""
+        client = _client()
+        events = _make_events(8)
+        success_markets = [[_fake_market_raw(f"MKT-{e}-0")] for e in range(3)]
+        fail_side_effects = [_conn_error()] * 5
+        self._setup(client, events, [*success_markets, *fail_side_effects])
+
+        with pytest.raises(KalshiDiscoverAbortedError) as exc_info:
+            client.discover_all_markets(consecutive_fail_limit=5)
+
+        assert exc_info.value.consecutive_failures == 5
+        assert client.get_markets_for_event.call_count == 8  # 3 success + 5 failures

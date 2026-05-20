@@ -26,6 +26,26 @@ from app.models import BookLevel, KalshiMarketRow, KalshiSnapshotRow
 
 _log = logging.getLogger(__name__)
 
+_CIRCUIT_FAIL_LIMIT = 5  # consecutive per-event failures before aborting discover
+
+
+class KalshiDiscoverAbortedError(Exception):
+    """Raised by discover_all_markets when the circuit breaker trips."""
+
+    def __init__(self, consecutive_failures: int) -> None:
+        self.consecutive_failures = consecutive_failures
+        super().__init__(
+            f"Kalshi discover aborted after {consecutive_failures} consecutive failures"
+        )
+
+
+def _is_circuit_breaker_error(exc: Exception) -> bool:
+    """Return True for errors that indicate a sustained outage (DNS, connection, 5xx)."""
+    if isinstance(exc, requests.HTTPError):
+        resp = exc.response
+        return resp is not None and resp.status_code >= 500
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
+
 
 class KalshiClient:
     def __init__(self, cfg: KalshiConfig) -> None:
@@ -57,6 +77,43 @@ class KalshiClient:
         """GET /markets?event_ticker={ticker} — returns markets for one event."""
         data = self._get("/markets", {"event_ticker": event_ticker, "limit": 200})
         return data.get("markets", [])
+
+    def discover_all_markets(
+        self, consecutive_fail_limit: int = _CIRCUIT_FAIL_LIMIT
+    ) -> list[tuple[dict[str, Any], str | None]]:
+        """Fetch all open events then their markets, with a circuit breaker.
+
+        Iterates every event returned by get_all_open_events() and fetches its
+        markets.  Per-event errors that are NOT connection/DNS/5xx (e.g. 404) are
+        logged as warnings and skipped.  Connection, DNS, and 5xx errors count
+        toward a consecutive-failure counter; if that counter reaches
+        consecutive_fail_limit without an intervening success the method raises
+        KalshiDiscoverAbortedError so the caller can abort quickly rather than
+        grinding through tens of thousands of failing requests.
+
+        Returns a flat list of (market_raw, category) tuples for all successfully
+        fetched markets.
+        """
+        events = self.get_all_open_events()
+        results: list[tuple[dict[str, Any], str | None]] = []
+        consecutive_failures = 0
+        for event in events:
+            event_ticker = event.get("event_ticker", "")
+            category: str | None = event.get("category")
+            try:
+                markets = self.get_markets_for_event(event_ticker)
+                consecutive_failures = 0
+                results.extend((m, category) for m in markets)
+            except Exception as exc:
+                if _is_circuit_breaker_error(exc):
+                    consecutive_failures += 1
+                    if consecutive_failures >= consecutive_fail_limit:
+                        raise KalshiDiscoverAbortedError(consecutive_failures) from exc
+                _log.warning(
+                    "kalshi_discover_event_error",
+                    extra={"event_ticker": event_ticker, "error": str(exc)},
+                )
+        return results
 
     # ------------------------------------------------------------------
     # Orderbook
