@@ -12,7 +12,8 @@ import pytest
 
 from app.signing import build_v2_order, make_test_client
 
-# Known harmless test private key (Hardhat/anvil account 0 — no real funds)
+# Hardhat default test account #0 — public test key from Hardhat documentation.
+# See https://hardhat.org/hardhat-network/docs/reference#accounts
 _TEST_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 _TEST_TOKEN = "99999999999999999999999999999999999999999999999999999999999999999"
 

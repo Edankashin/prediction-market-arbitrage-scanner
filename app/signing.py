@@ -124,7 +124,8 @@ def make_test_client(
     """
     from py_clob_client_v2.client import ClobClient
 
-    # Well-known Ethereum test private key (no real funds; do not use in prod)
+    # Hardhat default test account #0 — public test key from Hardhat documentation.
+    # See https://hardhat.org/hardhat-network/docs/reference#accounts
     _TEST_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
     key = private_key or _TEST_KEY
 
